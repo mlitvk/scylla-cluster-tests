@@ -1,0 +1,38 @@
+# Logstor gradual throughput steps - latency thresholds.
+#
+# Layered on top of latency-decorator-error-thresholds-steps-ent-tablets.yaml, which
+# carries cassandra-stress' calibrated steps (50000 / 150000 / 300000) and no entry for
+# any rate logstor runs at. sdcm/argus_results.py:344 resolves a step's rules as
+# `thresholds[workload]["default"] | thresholds[workload].get(step_name, {})`, so a step
+# whose name is absent inherits `default` wholesale - and `default` comes from
+# defaults/test_default.yaml, where P99 read and P99 write are both **10 ms**.
+#
+# 10 ms is a cassandra-stress number for an sstable cluster reading out of cache. This
+# workload reads with BYPASS CACHE at ~75-80% of a device-bound ceiling, which is a
+# different measurement entirely: on aws2 the same workload measured read p99 **2.43 ms**
+# at half the device budget and **45.84 ms** at the whole of it (plans/device-share-log.md,
+# slots 2 and 3). Inheriting 10 ms therefore raises FailedResultEvent and fails the job
+# on a run that is doing exactly what it was asked to do.
+#
+# Null until there is a baseline, in the manner of
+# latency-decorator-error-thresholds-steps-latte-tablets.yaml. To calibrate: take the
+# 480000_2 step's P99s from the first clean run, add ~25% for run-to-run variance, and
+# put the numbers below with the Jenkins build they came from - the convention the
+# lwt-heavy-tablets file follows.
+#
+# Only `mixed` is overridden, because test_mixed_gradual_increase_load is the only
+# sub-test these logstor pipelines run. Should test_read_gradual_increase_load or
+# test_write_gradual_increase_load ever be enabled for logstor, their `default` still
+# carries the same uncalibrated 10 ms and needs the same treatment.
+
+latency_decorator_error_thresholds:
+  mixed:
+    default:
+      P90 read:
+        fixed_limit: null
+      P90 write:
+        fixed_limit: null
+      P99 read:
+        fixed_limit: null
+      P99 write:
+        fixed_limit: null
