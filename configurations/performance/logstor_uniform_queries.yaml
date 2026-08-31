@@ -26,10 +26,36 @@
 # pool at the trigger and compaction already running.
 #
 # Argus names the two steps 480000_1 (conditioning, discard) and 480000_2 (the result).
+# THE CYCLE SLOT TABLE. latte derives a key from the cycle id - random distribution is
+# OFFSET + hash_range(i, ROW_COUNT), a pure function of i - and the column values are
+# derived from that key in turn, so two write runs sharing a --start-cycle replay the
+# same keys in the same order with the same bytes. The second then kills the first's
+# records front to back: whole segments die together instead of decaying uniformly,
+# compaction faces a bimodal population and **write amplification comes out
+# flatteringly low** - the one number this test exists to measure. method.txt section 5
+# is the rule; these are its slots for this test.
+#
+#   480000_1 write       1
+#   480000_1 read     5_000_000_000
+#   480000_2 write   10_000_000_000
+#   480000_2 read    15_000_000_000
+#
+# Spacing is 5e9, not method.txt's 1e9: that figure is sized for its 5-minute runs
+# (~120M cycles), while a 60-minute read step here consumes 336k x 3600 = 1.21e9 and a
+# rate increase would consume more. The populate needs no slot of its own - it runs the
+# sequential distribution (i % ROW_COUNT), a different mapping, so it replays nothing
+# these steps do and nothing they do replays it.
+#
+# A REPEATED RUN TAKES A NEW SLOT. If you re-run a step against a pool an earlier run
+# already wrote, shift its slot; re-using it is exactly the replay this table prevents.
 perf_gradual_throttle_steps:
   mixed:
-    - {threads: 64, concurrency: 48, rate: '480000', write_rate: '144000', read_rate: '336000', duration: '30m', wait_no_compactions: false}
-    - {threads: 64, concurrency: 48, rate: '480000', write_rate: '144000', read_rate: '336000', duration: '60m'}
+    - {threads: 64, concurrency: 48, rate: '480000', write_rate: '144000', read_rate: '336000',
+       write_start_cycle: 1, read_start_cycle: 5000000000,
+       duration: '30m', wait_no_compactions: false}
+    - {threads: 64, concurrency: 48, rate: '480000', write_rate: '144000', read_rate: '336000',
+       write_start_cycle: 10000000000, read_start_cycle: 15000000000,
+       duration: '60m'}
 
 # Fallback for a step that does not carry its own duration; both above do.
 perf_gradual_step_duration: {"mixed": '60m'}
@@ -57,14 +83,14 @@ stress_cmd_m:
   - >-
     latte run --function write --consistency QUORUM --duration $duration
     --threads $threads --concurrency $concurrency --rate $write_rate
-    --start-cycle 1
+    --start-cycle $write_start_cycle
     -P row_count=500000000 -P offset=0 -P distribution=\"random\"
     -P column_count=10 -P column_size=200 -P key_size=48
     data_dir/latte/latte_cs_alike.rn
   - >-
     latte run --function read --consistency ONE --duration $duration
     --threads $threads --concurrency $concurrency --rate $read_rate
-    --start-cycle 1
+    --start-cycle $read_start_cycle
     -P row_count=500000000 -P offset=0 -P distribution=\"random\"
     -P column_count=10 -P column_size=200 -P key_size=48 -P bypass_cache=true
     data_dir/latte/latte_cs_alike.rn
