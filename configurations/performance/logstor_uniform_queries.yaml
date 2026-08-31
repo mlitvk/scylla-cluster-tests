@@ -5,14 +5,33 @@
 # over an unbounded cycle range (no --end-cycle) so the key sequence never repeats within the run.
 # Schema: 10 columns x 200 bytes each (matching kv_uniform.rn reference)
 # Reads use BYPASS CACHE, so a read is served by the storage engine and not the row cache
-# Mixed (write:30,read:70) workload ramps to 500k ops/s before the 60m measured step
+# Mixed (write:30,read:70) at 480k ops/s: a 30m conditioning step, then the 60m measured step
 # This test is a part of the benchmark done by Aerospike
 # https://aerospike.com/files/benchmarks/aerospike-vs-scylladb-performance-and-cost-at-multi-terabyte-scale.pdf
 
+# Two steps at the same offered load: the first conditions the pool and is discarded,
+# the second is the measurement. The populate writes each of the 500M keys exactly once,
+# so it leaves a pool holding live data and *no garbage at all* - nothing for compaction
+# to reclaim and nothing to reclaim it from. Measuring straight off that pool reports a
+# write amplification of ~1 and a compaction cost of zero, neither of which survives
+# contact with steady state. The conditioning step overwrites at the measured rate until
+# free segments fall to logstor_compaction_trigger_threshold (~8 minutes at 0.5), and
+# then keeps going long enough for compaction, write amplification and space
+# amplification to settle.
+#
+# wait_no_compactions: false on the first step is the point of the pair. The default
+# between steps is to wait for compactions to finish and then sleep 180s, which would
+# hand the measured step a pool compaction had just emptied of garbage - the state the
+# conditioning was meant to leave behind. With it off, the measured step starts with the
+# pool at the trigger and compaction already running.
+#
+# Argus names the two steps 480000_1 (conditioning, discard) and 480000_2 (the result).
 perf_gradual_throttle_steps:
   mixed:
+    - {threads: 64, concurrency: 48, rate: '480000', write_rate: '144000', read_rate: '336000', duration: '30m', wait_no_compactions: false}
     - {threads: 64, concurrency: 48, rate: '480000', write_rate: '144000', read_rate: '336000', duration: '60m'}
 
+# Fallback for a step that does not carry its own duration; both above do.
 perf_gradual_step_duration: {"mixed": '60m'}
 
 # No cache warmup for uniform workload (data is uniformly distributed, no hot set)

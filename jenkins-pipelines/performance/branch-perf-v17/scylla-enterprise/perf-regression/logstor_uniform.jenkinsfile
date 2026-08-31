@@ -3,6 +3,32 @@
 // trick from https://github.com/jenkinsci/workflow-cps-global-lib-plugin/pull/43
 def lib = library identifier: 'sct@snapshot', retriever: legacySCM(scm)
 
+// Build parameters this job MUST be given. perfRegressionParallelPipeline hardcodes the
+// defaults for all of them rather than reading them from pipelineParams, so they cannot
+// be set from here - enter them in "Build with Parameters":
+//
+//   byo_scylla_repo      https://github.com/mlitvk/scylladb
+//   byo_scylla_branch    logstor_perf
+//   billing_project      LogStor
+//   byo_build_both_arch  unticked
+//   scylla_version       empty
+//   scylla_ami_id        empty
+//
+// The build source is not optional here. The direct write path exists only on the byo
+// branch: master carries no logstor_direct_writes_enabled, no
+// logstor_direct_write_memory_in_mb, no logstor_format_on_startup and no
+// logstor_compaction_trigger_threshold, and scylla logs an unknown scylla.yaml key as a
+// warning and starts anyway - so a run handed scylla_version=master:latest silently
+// ignores everything enable_logstor.yaml pins and measures the separator path instead.
+// That is what every earlier logstor-uniform build did, and why they died a few minutes
+// into the measured step with "logstor - Error writing mutation: condition_variable
+// timed out": the offered rate was ~1.7x the ceiling of the path they were actually on.
+//
+// byo_build_both_arch is not needed. byoScylladb.groovy already derives the DB
+// architecture from instance_type_db (i4g.4xlarge -> arm64) by calling
+// 'hydra get-db-arch' on this test_config, and installs the ARM image it built; the flag
+// only adds a second x86 build that this job never uses.
+
 perfRegressionParallelPipeline(
     backend: "aws",
     region: "us-east-1",

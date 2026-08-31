@@ -3,9 +3,21 @@ experimental_features:
 
 append_scylla_yaml:
   logstor_disk_size_in_mb: 80000
-  logstor_separator_max_memory_in_mb: 256
   logstor_format_on_startup: true
   force_capacity_based_balancing: true
+  # Keep half the segments free. The shipped default is 0.05, which this workload
+  # never reaches: the pool is 80 GB per *shard* x 15 shards = 1.26 TB per node
+  # against ~556 GB of live data (44% utilization), so at 144k client writes/s a node
+  # lays down ~160 MB/s of fresh log and free segments do not fall to 5% for ~66
+  # minutes - past the end of a 60m step. At 0.5 the trigger is reached ~8 minutes in,
+  # so the run measures a compacting pool rather than a pristine one.
+  # It is deliberately a hard operating point: free >= 50% with live at 44% leaves
+  # only ~6 points (~73 GB per node) for garbage, so space amplification stays near 1
+  # and write amplification pays for it. Should the record turn out much larger than
+  # ~2.2 KB, live crosses 50% of the pool and the trigger becomes unsatisfiable - the
+  # conditioning step in logstor_uniform_queries.yaml is where that would show up, as
+  # compaction that never goes idle. LiveUpdate, pinned so a run records it.
+  logstor_compaction_trigger_threshold: 0.5
   # 64 MB over the 128 KiB segment gives 256 hot groups per shard on the direct
   # write path, against 8 at the shipped 2 MB default. Not LiveUpdate, so it has
   # to be here rather than set on a running node.
@@ -23,9 +35,11 @@ append_scylla_args: '++ --task-quota-ms 0.2'
 n_db_nodes: 4
 n_loaders: 1
 # Nodes used to replicate the Aerospike test to be able to compare the results.
-# i4g.4xlarge is Graviton, so the db nodes need an aarch64 build: SCT derives the
-# architecture from instance_type_db, but only on the unified_package /
-# relocatable: path, not from a plain scylla_version or scylla_ami_id.
+# i4g.4xlarge is Graviton, so the db nodes need an aarch64 build. Two routes derive
+# that from instance_type_db: the unified_package / relocatable: path in sct_config,
+# and byoScylladb.groovy, which asks 'hydra get-db-arch' and installs the ARM image
+# it built. A plain scylla_version or scylla_ami_id derives nothing and will hand
+# these nodes an x86_64 build.
 instance_type_db: 'i4g.4xlarge'
 instance_type_loader: 'c6i.16xlarge'
 
