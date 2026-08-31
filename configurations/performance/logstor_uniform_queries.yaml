@@ -6,7 +6,10 @@
 # Schema: 10 columns x 200 bytes each (matching kv_uniform.rn reference)
 # Reads use BYPASS CACHE, so a read is served by the storage engine and not the row cache
 # Mixed (write:30,read:70) at 480k ops/s, measured over 60m, after a 45m write-only
-# conditioning step at 300k that brings the pool to the compaction trigger
+# conditioning step at 300k that brings the pool to the compaction trigger.
+# The measured step is 30m: the pool is already at the trigger with compaction
+# running when it starts, so it is stationary throughout and 30 minutes at 480k is
+# ~864M operations - far more than the percentiles need.
 #
 # TWO LATTE SEMANTICS THAT READ WRONG (method.txt section 4):
 #  --concurrency IS PER THREAD. "Max number of concurrent async requests PER THREAD",
@@ -87,7 +90,7 @@ perf_gradual_throttle_steps:
        duration: '45m', wait_no_compactions: false}
     - {threads: 64, concurrency: 48, rate: '480000', write_rate: '144000', read_rate: '336000',
        write_start_cycle: 10000000000, read_start_cycle: 15000000000,
-       duration: '60m'}
+       duration: '30m'}
 
 # Fallback for a step that does not carry its own duration; both above do.
 perf_gradual_step_duration: {"mixed": '60m'}
