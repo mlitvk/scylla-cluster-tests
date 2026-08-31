@@ -5,7 +5,8 @@
 # over an unbounded cycle range (no --end-cycle) so the key sequence never repeats within the run.
 # Schema: 10 columns x 200 bytes each (matching kv_uniform.rn reference)
 # Reads use BYPASS CACHE, so a read is served by the storage engine and not the row cache
-# Mixed (write:30,read:70) at 480k ops/s: a 30m conditioning step, then the 60m measured step
+# Mixed (write:30,read:70) at 480k ops/s, measured over 60m, after a 45m write-only
+# conditioning step at 300k that brings the pool to the compaction trigger
 # This test is a part of the benchmark done by Aerospike
 # https://aerospike.com/files/benchmarks/aerospike-vs-scylladb-performance-and-cost-at-multi-terabyte-scale.pdf
 
@@ -48,11 +49,29 @@
 #
 # A REPEATED RUN TAKES A NEW SLOT. If you re-run a step against a pool an earlier run
 # already wrote, shift its slot; re-using it is exactly the replay this table prevents.
+# CONDITIONING IS WRITE-DOMINATED, because only writes make garbage. Reads cost
+# device budget and move the trigger no closer, so the old 30/70 conditioning step
+# needed ~68 minutes to reach 5% free and never got there inside 30. At 300k client
+# writes/s a node lays down ~330 MB/s of fresh log, so the ~643 GB of garbage the
+# trigger needs arrives at **~33 minutes**, and a 45m step leaves ~12 minutes for
+# compaction, wa and sa to settle before anything is measured. This mirrors
+# method.txt's own CONDITION step, which is --read-ratio 0.
+#
+# read_rate is 1 rather than 0: stress_cmd_m is one template shared by both steps, so
+# the read command cannot be dropped for one of them without an sdcm change, and
+# latte's runtime behaviour for `--rate 0` is unverified - if it meant "unthrottled"
+# rather than "no cycles" the conditioning step would saturate on reads. 1 cycle/s is
+# ~2,700 reads over 45 minutes against ~810M writes: nothing, and unambiguous.
+#
+# The measured step is deliberately unchanged at 480k / 30-70: section 6 puts the
+# device-bound ceiling at ~610-650k, so 480k keeps ~25% of headroom and measures the
+# storage engine rather than saturation, and it is the rate the Aerospike reference
+# in the header uses.
 perf_gradual_throttle_steps:
   mixed:
-    - {threads: 64, concurrency: 48, rate: '480000', write_rate: '144000', read_rate: '336000',
+    - {threads: 64, concurrency: 48, rate: '300000', write_rate: '300000', read_rate: '1',
        write_start_cycle: 1, read_start_cycle: 5000000000,
-       duration: '30m', wait_no_compactions: false}
+       duration: '45m', wait_no_compactions: false}
     - {threads: 64, concurrency: 48, rate: '480000', write_rate: '144000', read_rate: '336000',
        write_start_cycle: 10000000000, read_start_cycle: 15000000000,
        duration: '60m'}
