@@ -36,3 +36,20 @@ latency_decorator_error_thresholds:
         fixed_limit: null
       P99 write:
         fixed_limit: null
+    # The conditioning step is named for its rate, and 300000 is a step name the
+    # ent-tablets file already carries with calibrated cassandra-stress limits
+    # (P99 read and write both 5 ms). A step-specific entry beats `default` in
+    # argus_results.py:344, so without this the *discarded* conditioning step -
+    # write-only at 300k against a logstor pool - would be gated at 5 ms and would
+    # fail the job. Nulled here because this file loads after ent-tablets in the
+    # test_config list. If the conditioning rate changes, check the new name against
+    # that file's `mixed` keys: today they are 50000, 150000, 300000, unthrottled.
+    "300000":
+      P90 read:
+        fixed_limit: null
+      P90 write:
+        fixed_limit: null
+      P99 read:
+        fixed_limit: null
+      P99 write:
+        fixed_limit: null
