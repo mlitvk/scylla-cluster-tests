@@ -7,6 +7,19 @@
 # Reads use BYPASS CACHE, so a read is served by the storage engine and not the row cache
 # Mixed (write:30,read:70) at 480k ops/s, measured over 60m, after a 45m write-only
 # conditioning step at 300k that brings the pool to the compaction trigger
+#
+# TWO LATTE SEMANTICS THAT READ WRONG (method.txt section 4):
+#  --concurrency IS PER THREAD. "Max number of concurrent async requests PER THREAD",
+#    so --threads 64 --concurrency 48 is **3,072 requests in flight per command**, not
+#    48, and two commands run at once. That is deliberate headroom: at 480k ops/s and
+#    ~2 ms this workload needs ~960 in flight, so the cap is ~3x and is not the binding
+#    constraint. It does mean that if the cluster saturates, latte queues up to the cap
+#    and the reported p99 is queueing delay, not service time - which is what the
+#    "offered rate held" gate in the runbook's section 7 is there to catch.
+#  --warmup DEFAULTS TO 1 CYCLE, which is what method.txt requires of a write-bearing
+#    run, so omitting it was already correct. It is passed explicitly on the write
+#    commands anyway: latte's default is not a contract, and a warmup measured in
+#    seconds would replay the head of the measured stream if the counter restarts.
 # This test is a part of the benchmark done by Aerospike
 # https://aerospike.com/files/benchmarks/aerospike-vs-scylladb-performance-and-cost-at-multi-terabyte-scale.pdf
 
@@ -102,7 +115,7 @@ stress_cmd_m:
   - >-
     latte run --function write --consistency QUORUM --duration $duration
     --threads $threads --concurrency $concurrency --rate $write_rate
-    --start-cycle $write_start_cycle
+    --start-cycle $write_start_cycle --warmup 1
     -P row_count=500000000 -P offset=0 -P distribution=\"random\"
     -P column_count=10 -P column_size=200 -P key_size=48
     data_dir/latte/latte_cs_alike.rn

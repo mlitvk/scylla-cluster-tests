@@ -5,6 +5,15 @@ append_scylla_yaml:
   logstor_disk_size_in_mb: 80000
   logstor_format_on_startup: true
   force_capacity_based_balancing: true
+  # 1 TiB, so the size-based split candidate is zero at any data size this test
+  # reaches and the tablet count stays where min_per_shard_tablet_count: 64 put it.
+  # method.txt section 5 requires this: a split or merge mid-run changes the
+  # configuration underneath the measurement, and the shipped target is 5 GiB against
+  # ~290 MB per tablet replica here - close enough that a larger record, a longer run
+  # or a smaller tablet count could reach it. This is mechanism (a) of the two that
+  # section 5 asks for; (b) is POST /storage_service/tablets/balancing?enabled=false,
+  # which SCT has no hook for - see the runbook's trap 13.
+  target_tablet_size_in_bytes: 1099511627776
   # The shipped default, and the operating point every local measurement was taken
   # at - so the byte ratios this run should reproduce (wa 1.31-1.40, fg_wa 1.01-1.04,
   # comp ~23% of the device budget, sa ~1.9) are directly comparable rather than
