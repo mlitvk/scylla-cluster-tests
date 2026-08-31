@@ -6,15 +6,30 @@ append_scylla_yaml:
   logstor_separator_max_memory_in_mb: 256
   logstor_format_on_startup: true
   force_capacity_based_balancing: true
+  # 64 MB over the 128 KiB segment gives 256 hot groups per shard on the direct
+  # write path, against 8 at the shipped 2 MB default. Not LiveUpdate, so it has
+  # to be here rather than set on a running node.
+  logstor_direct_write_memory_in_mb: 64
+  # The direct write path requires a periodic commitlog sync. This is already the
+  # default; it is pinned because the path goes silently missing without it.
+  commitlog_sync: periodic
+  # Also already the default, pinned so a run's configuration records which side
+  # of the live switch it was on.
+  logstor_direct_writes_enabled: true
 
 # Append --task-quota-ms 0.2 to existing append_scylla_args (++ prefix appends instead of replacing)
 append_scylla_args: '++ --task-quota-ms 0.2'
 
 n_db_nodes: 4
 n_loaders: 1
-# Nodes used to replicate the Aerospike test to be able to compare the results
-instance_type_db: 'i4i.4xlarge'
+# Nodes used to replicate the Aerospike test to be able to compare the results.
+# i4g.4xlarge is Graviton, so the db nodes need an aarch64 build: SCT derives the
+# architecture from instance_type_db, but only on the unified_package /
+# relocatable: path, not from a plain scylla_version or scylla_ami_id.
+instance_type_db: 'i4g.4xlarge'
 instance_type_loader: 'c6i.16xlarge'
 
 simulated_racks: 2
 rack_aware_loader: true
+
+user_prefix: 'logstor-uniform-mlitvk'

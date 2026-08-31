@@ -4,13 +4,14 @@
 # Measured step: random uniform selection (distribution="random" -> hash_range(i, ROW_COUNT))
 # over an unbounded cycle range (no --end-cycle) so the key sequence never repeats within the run.
 # Schema: 10 columns x 200 bytes each (matching kv_uniform.rn reference)
-# Mixed (write:30,read:70) workload ramps to 600k ops/s before the 60m measured step
+# Reads use BYPASS CACHE, so a read is served by the storage engine and not the row cache
+# Mixed (write:30,read:70) workload ramps to 500k ops/s before the 60m measured step
 # This test is a part of the benchmark done by Aerospike
 # https://aerospike.com/files/benchmarks/aerospike-vs-scylladb-performance-and-cost-at-multi-terabyte-scale.pdf
 
 perf_gradual_throttle_steps:
   mixed:
-    - {threads: 64, concurrency: 48, rate: '600000', write_rate: '180000', read_rate: '420000', duration: '60m'}
+    - {threads: 64, concurrency: 48, rate: '480000', write_rate: '144000', read_rate: '336000', duration: '60m'}
 
 perf_gradual_step_duration: {"mixed": '60m'}
 
@@ -46,7 +47,7 @@ stress_cmd_m:
     --threads $threads --concurrency $concurrency --rate $read_rate
     --start-cycle 1
     -P row_count=500000000 -P offset=0 -P distribution=\"random\"
-    -P column_count=10 -P column_size=200 -P key_size=48
+    -P column_count=10 -P column_size=200 -P key_size=48 -P bypass_cache=true
     data_dir/latte/latte_cs_alike.rn
 
 latte_schema_parameters:
