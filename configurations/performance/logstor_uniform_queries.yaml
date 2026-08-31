@@ -104,10 +104,30 @@ prepare_stress_cmd: >-
   data_dir/latte/latte_cs_alike.rn
 
 # Populate 500M rows with uniform distribution
+# 400k, not 250k: the populate is pure writes with compaction idle throughout (the pool
+# only fills to ~56% free, nowhere near the 5% trigger), so it is the lightest phase of
+# the run and there is no reason to throttle it to below the conditioning step's rate.
+# 400k client writes/s is 200k replica writes/s per node, ~440 MB/s of fresh log and
+# ~13.3k per shard against the ~37,700 per-hyperthread CPU ceiling - so ~21 minutes
+# instead of ~33. Build 5 delivered 250k in exactly the 33.3 min the arithmetic
+# predicts, so 250k was a floor and not a ceiling.
+#
+# threads/concurrency rise with it, and must: --concurrency is PER THREAD, so 32 x 32
+# caps in flight at 1,024, which covers 400k only if writes land inside 2.56 ms. At
+# CL=ALL they will not. 64 x 48 = 3,072 covers up to ~7.7 ms, and the rate cap still
+# governs the offered load.
+#
+# TWO FAILURE MODES, AND ONLY ONE IS SAFE. If the cluster cannot absorb 400k, latte
+# reports a rate deficit and the populate simply takes longer - visible and harmless.
+# If instead writes start erroring at CL=ALL, the affected rows are never written and
+# the data set is quietly smaller than 500M, which moves live data off ~556 GB and
+# invalidates every utilization and time-to-trigger figure downstream. So after the
+# populate, check the latte summary for errors and confirm pool utilization is ~44%
+# before trusting the run. Drop back toward 250k if either looks wrong.
 prepare_write_cmd:
   - >-
     latte run --function write --consistency ALL --duration 500000000
-    --threads 32 --concurrency 32 --rate 250000
+    --threads 64 --concurrency 48 --rate 400000
     --start-cycle 1 --end-cycle 500000000
     -P row_count=500000000 -P offset=0
     -P column_count=10 -P column_size=200 -P key_size=48
