@@ -14,11 +14,16 @@
 # TWO LATTE SEMANTICS THAT READ WRONG (method.txt section 4):
 #  --concurrency IS PER THREAD. "Max number of concurrent async requests PER THREAD",
 #    so --threads 64 --concurrency 48 is **3,072 requests in flight per command**, not
-#    48, and two commands run at once. That is deliberate headroom: at 480k ops/s and
-#    ~2 ms this workload needs ~960 in flight, so the cap is ~3x and is not the binding
-#    constraint. It does mean that if the cluster saturates, latte queues up to the cap
-#    and the reported p99 is queueing delay, not service time - which is what the
-#    "offered rate held" gate in the runbook's section 7 is there to catch.
+#    48, and two commands run at once. THIS WAS THE BINDING CONSTRAINT IN BUILD 6, and
+#    the reason the read command has its own read_concurrency now. That build sized the
+#    cap on an assumed ~2 ms read ("~960 in flight at 480k"); the measured read was
+#    10.787 ms, so 3,072 in flight bought only 3,072 / 10.787 ms = 284,800 op/s and the
+#    read delivered 284,451 of the 336,000 offered - Little's Law to within 0.2%. The
+#    write command, at 2 +/- 1 in flight, never came near its own cap.
+#    When latte cannot offer the rate, its reported "cycle latency" is scheduling lag
+#    and not service time: build 6's read cycle p50 was 137 SECONDS against a request
+#    latency of 10.787 ms. Read `Request latency` from the latte summary, never `Cycle
+#    latency`, whenever the offered-rate gate in the runbook's section 7 has failed.
 #  --warmup DEFAULTS TO 1 CYCLE, which is what method.txt requires of a write-bearing
 #    run, so omitting it was already correct. It is passed explicitly on the write
 #    commands anyway: latte's default is not a contract, and a warmup measured in
@@ -101,10 +106,12 @@
 # in the header uses.
 perf_gradual_throttle_steps:
   mixed:
-    - {threads: 64, concurrency: 48, rate: '300000', write_rate: '300000', read_rate: '100',
+    - {threads: 64, concurrency: 48, read_concurrency: 48,
+       rate: '300000', write_rate: '300000', read_rate: '100',
        write_start_cycle: 1, read_start_cycle: 5000000000,
        duration: '45m', wait_no_compactions: false}
-    - {threads: 64, concurrency: 48, rate: '480000', write_rate: '144000', read_rate: '336000',
+    - {threads: 64, concurrency: 48, read_concurrency: 64,
+       rate: '480000', write_rate: '144000', read_rate: '336000',
        write_start_cycle: 10000000000, read_start_cycle: 15000000000,
        duration: '30m'}
 
@@ -160,7 +167,7 @@ stress_cmd_m:
     data_dir/latte/latte_cs_alike.rn
   - >-
     latte run --function read --consistency ONE --duration $duration
-    --threads $threads --concurrency $concurrency --rate $read_rate
+    --threads $threads --concurrency $read_concurrency --rate $read_rate
     --start-cycle $read_start_cycle
     -P row_count=500000000 -P offset=0 -P distribution=\"random\"
     -P column_count=10 -P column_size=200 -P key_size=48 -P bypass_cache=true
