@@ -78,11 +78,22 @@
 # compaction, wa and sa to settle before anything is measured. This mirrors
 # method.txt's own CONDITION step, which is --read-ratio 0.
 #
-# read_rate is 1 rather than 0: stress_cmd_m is one template shared by both steps, so
+# read_rate is 100 rather than 0: stress_cmd_m is one template shared by both steps, so
 # the read command cannot be dropped for one of them without an sdcm change, and
 # latte's runtime behaviour for `--rate 0` is unverified - if it meant "unthrottled"
-# rather than "no cycles" the conditioning step would saturate on reads. 1 cycle/s is
-# ~2,700 reads over 45 minutes against ~810M writes: nothing, and unambiguous.
+# rather than "no cycles" the conditioning step would saturate on reads. 100 cycles/s is
+# ~270,000 reads over 45 minutes against ~810M writes: nothing, and unambiguous.
+#
+# 100 and not 1, which is what build 6 ran. At 1/s most HDR intervals contain no read
+# sample at all, so LatteHDRExporter.split_line (sdcm/loader.py:312) gets an empty
+# histogram, logs "Got empty HDR histogram summary", and returns [] - and
+# get_metric_value (sdcm/loader.py:101) then logs one "list index out of range" warning
+# per percentile. Six lines per interval, ~9,700 over the step, about half of build 6's
+# console. Harmless - it only starves the live Grafana read-latency panel, since Argus
+# reads the .hdr files over the whole step via make_hdrhistogram_summary
+# (sdcm/tester.py:5004), a different path - and this step is discarded anyway. But the
+# noise buries the lines that do matter. 100/s fills every interval, still costs
+# essentially no device budget, and moves the compaction trigger no closer.
 #
 # The measured step is deliberately unchanged at 480k / 30-70: section 6 puts the
 # device-bound ceiling at ~610-650k, so 480k keeps ~25% of headroom and measures the
@@ -90,7 +101,7 @@
 # in the header uses.
 perf_gradual_throttle_steps:
   mixed:
-    - {threads: 64, concurrency: 48, rate: '300000', write_rate: '300000', read_rate: '1',
+    - {threads: 64, concurrency: 48, rate: '300000', write_rate: '300000', read_rate: '100',
        write_start_cycle: 1, read_start_cycle: 5000000000,
        duration: '45m', wait_no_compactions: false}
     - {threads: 64, concurrency: 48, rate: '480000', write_rate: '144000', read_rate: '336000',
