@@ -21,18 +21,21 @@ append_scylla_yaml:
   # 44% leaves ~51 points of the pool (~643 GB per node) for garbage, where 0.5 would
   # leave ~6.
   #
-  # The cost is that the trigger takes ~67 minutes to arrive, which is longer than
-  # the 30m conditioning step in logstor_uniform_queries.yaml. The pool is 80 GB per
-  # *shard* x 15 shards = 1.26 TB per node against ~556 GB of live data (44%
-  # utilization); at 144k client writes/s x RF 2 over 4 nodes a node lays down
-  # ~160 MB/s of fresh log, so filling ~643 GB of garbage takes ~67 min. Conditioning
-  # ends at 30 min, so **the trigger lands roughly 37 minutes into the 60m measured
-  # step**: read that step as ~37 min of a pristine pool (wa ~1, compaction 0)
-  # followed by ~23 min of a compacting one, and do not read its averages as steady
-  # state. Grafana's free-segment fraction and compaction share are where the
-  # crossover is visible; the settled ratios are the last few minutes, not the mean.
-  # Deliberate - the alternative was a 90m conditioning step. LiveUpdate, pinned so a
-  # run records it.
+  # The cost is that the trigger takes a while to arrive, and the conditioning step in
+  # logstor_uniform_queries.yaml is sized around it. The pool is 80 GB per *shard*
+  # x 15 shards = 1.26 TB per node against ~556 GB of live data (44% utilization), so
+  # ~51 points of the pool - ~643 GB per node - must fill with garbage before the
+  # trigger fires. Only writes make garbage, which is why that step is write-only: at
+  # 300k client writes/s x RF 2 over 4 nodes a node lays down ~330 MB/s of fresh log
+  # and the trigger arrives at **~33 minutes**, leaving ~12 of the step's 45 for
+  # compaction, wa and sa to settle. The 480000 step that follows therefore starts
+  # with the pool at the trigger and compaction already running, and is stationary
+  # over its whole 30 minutes - its Argus aggregates are quotable as they stand.
+  #
+  # The earlier shape conditioned at the measured 30/70 mix for 30 minutes, which
+  # reaches only ~288 GB and pushed the crossover ~37 minutes into the measured step;
+  # build 5's averages mix a pristine pool with a compacting one for that reason. See
+  # the runbook's trap 12. LiveUpdate, pinned so a run records it.
   logstor_compaction_trigger_threshold: 0.05
   # 64 MB over the 128 KiB segment gives 256 hot groups per shard on the direct
   # write path, against 8 at the shipped 2 MB default. Not LiveUpdate, so it has

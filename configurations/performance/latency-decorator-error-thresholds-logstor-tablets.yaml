@@ -16,9 +16,10 @@
 #
 # Null until there is a baseline, in the manner of
 # latency-decorator-error-thresholds-steps-latte-tablets.yaml. To calibrate: take the
-# 480000_2 step's P99s from the first clean run, add ~25% for run-to-run variance, and
-# put the numbers below with the Jenkins build they came from - the convention the
-# lwt-heavy-tablets file follows.
+# 480000 step's P99s from the first clean run, add ~25% for run-to-run variance, and put
+# the numbers below with the Jenkins build they came from - the convention the
+# lwt-heavy-tablets file follows. Leave the 300000 entry nulled: that step is discarded
+# conditioning, not a result.
 #
 # Only `mixed` is overridden, because test_mixed_gradual_increase_load is the only
 # sub-test these logstor pipelines run. Should test_read_gradual_increase_load or
