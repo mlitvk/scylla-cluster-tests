@@ -8,23 +8,60 @@
 # defaults/test_default.yaml, where P99 read and P99 write are both **10 ms**.
 #
 # 10 ms is a cassandra-stress number for an sstable cluster reading out of cache. This
-# workload reads with BYPASS CACHE at ~75-80% of a device-bound ceiling, which is a
-# different measurement entirely: on aws2 the same workload measured read p99 **2.43 ms**
+# workload reads with BYPASS CACHE at a large fraction of a device-bound ceiling, which is
+# a different measurement entirely: on aws2 the same workload measured read p99 **2.43 ms**
 # at half the device budget and **45.84 ms** at the whole of it (plans/device-share-log.md,
 # slots 2 and 3). Inheriting 10 ms therefore raises FailedResultEvent and fails the job
 # on a run that is doing exactly what it was asked to do.
 #
-# Null until there is a baseline, in the manner of
-# latency-decorator-error-thresholds-steps-latte-tablets.yaml. To calibrate: take the
-# 480000 step's P99s from the first clean run, add ~25% for run-to-run variance, and put
-# the numbers below with the Jenkins build they came from - the convention the
-# lwt-heavy-tablets file follows. Leave the 300000 entry nulled: that step is discarded
-# conditioning, not a result.
-#
-# Only `mixed` is overridden, because test_mixed_gradual_increase_load is the only
+# `default` stays nulled, so every rung of the ladder is ungated except the one calibrated
+# below. Only `mixed` is overridden, because test_mixed_gradual_increase_load is the only
 # sub-test these logstor pipelines run. Should test_read_gradual_increase_load or
 # test_write_gradual_increase_load ever be enabled for logstor, their `default` still
 # carries the same uncalibrated 10 ms and needs the same treatment.
+#
+# WHAT THESE NUMBERS ARE MEASURED FROM, because it is not what the report quotes.
+# Argus gates on the aggregate HDR histogram over the WHOLE step: the decorator takes
+# `start` before the step function and `end` after it (sdcm/utils/decorators.py:218-251),
+# hands both to make_hdrhistogram_summary (sdcm/tester.py:5004), and every interval in that
+# window is folded into one histogram whose percentiles become the "P90 read" / "P99 write"
+# columns, in ms (sdcm/utils/hdrhistogram.py:453). That is NOT the figure
+# sct-uniform-build7-report.md section 5 quotes - the report's 2.310 ms is the median of
+# the per-second p99s, which deliberately discards the bad seconds. The numbers below were
+# recomputed from build 7 rung 2's own .hdr files the way Argus folds them:
+#
+#   build 7 rung 2 (480k, read_concurrency 24), full-step aggregate, ms
+#                p50     p90     p95      p99     p99.9
+#     read      0.86    1.39    1.75   402.39   1180.70
+#     write     1.00    1.46    1.63     2.20      5.31
+#
+# Threshold = that figure + ~25% for run-to-run variance, the convention the
+# lwt-heavy-tablets file follows.
+#
+# P99 READ IS LEFT NULL ON PURPOSE, and 402.39 ms is why. The read command's first ten
+# seconds of every rung are a cold start, not a steady state: cycle p50 climbs 0.18 -> 1.17
+# seconds over six seconds while latte delivers 240k-260k/s against an offered 336k, then
+# over-fires to 461k/s draining the backlog, and from t=10s the rung is clean at 336k/s with
+# a per-second p99 of 2.0-2.9 ms. Those ten seconds are ~3.4M of the step's 241.9M read
+# samples - **1.4%**, just over the p99 boundary - so the aggregate p99 lands *inside* the
+# transient and is pinned there. It would not move if steady-state p99 doubled, or
+# decupled; it only moves if the cold start itself changes. A threshold on it would gate
+# nothing, which is worse than gating nothing openly. Excluding the first 60 s the same
+# histogram gives p99 read **2.64 ms**, and that is the number to put here the day the
+# transient is excluded at the source - the read command takes latte's default 1-cycle
+# warmup today, and a duration warmup on the READ command only is safe on exactly the
+# grounds logstor_uniform_queries.yaml gives for refusing one on the write commands (a
+# replayed read rewrites nothing, so it cannot distort write amplification).
+#
+# P90 read is the gate that does work. At 1.39 ms full-step against 1.35 ms excluding the
+# transient, it is untouched by the cold start - 1.4% of samples cannot reach the 10%
+# mark. It also catches an offered-rate failure loudly, which is the failure this workload
+# actually has a history of: build 6's measured step folds to a read p90 of **249
+# seconds**, because a rate deficit turns latte's cycle latency into scheduling lag.
+#
+# Both writes are gatable as they stand. The write command has no equivalent burst: it
+# holds 144k/s from t=0 and its first ten seconds cost latency (p50 ~3 ms) but not
+# scheduling, which moves full-step p99 write only from 1.94 to 2.20 ms.
 
 latency_decorator_error_thresholds:
   mixed:
@@ -54,3 +91,28 @@ latency_decorator_error_thresholds:
         fixed_limit: null
       P99 write:
         fixed_limit: null
+    # The 480k anchor, calibrated off Jenkins build 7 (test_id
+    # 39c980df-67d4-4c4e-ad7e-8a3ae14ee12a, 4 x i4g.4xlarge, logstor_perf @ 14f2483ff5),
+    # rung 2 - the same rate at the same read_concurrency 24, which delivered 480,000 of
+    # 480,000 offered. It is the only rung of the ladder with a directly comparable
+    # predecessor, so it is the only one gated; 550000 / 600000 / 700000 are exploratory
+    # and inherit the nulled default.
+    #
+    # Two keys, one set of limits. get_sequential_throttle_steps names the anchor
+    # `480000_1` while the ladder closes on a second 480k rung, and plain `480000` if that
+    # closing rung is ever dropped (_step_names appends a counter only to a repeated rate).
+    # Carrying both means the gate survives either shape rather than silently lapsing.
+    # `480000_2` is deliberately absent: the closing control runs after 36 minutes of
+    # higher load and exists to MEASURE drift, so failing the job on it would throw away
+    # the reading it was added to take.
+    "480000_1": &logstor_480k
+      P90 read:
+        fixed_limit: 1.75
+      P90 write:
+        fixed_limit: 1.85
+      # Null by construction, not by omission - see the header.
+      P99 read:
+        fixed_limit: null
+      P99 write:
+        fixed_limit: 2.75
+    "480000": *logstor_480k
