@@ -5,29 +5,30 @@
 # over an unbounded cycle range (no --end-cycle) so the key sequence never repeats within the run.
 # Schema: 10 columns x 200 bytes each (matching kv_uniform.rn reference)
 # Reads use BYPASS CACHE, so a read is served by the storage engine and not the row cache
-# Mixed (write:30,read:70) at 480k ops/s as a THREE-RUNG DEPTH LADDER, 12m per rung,
-# after a 45m write-only conditioning step at 300k that brings the pool to the
-# compaction trigger. Every rung is stationary - the pool is already at the trigger with
-# compaction running when the first one starts and no rung waits for compactions - and
-# 12 minutes at 480k is ~346M operations, far more than the percentiles need.
+# Mixed (write:30,read:70) as a FIVE-RUNG RATE LADDER - 480k / 550k / 600k / 700k / 480k,
+# 12m per rung - after a 45m write-only conditioning step at 300k that brings the pool to
+# the compaction trigger. Every rung is stationary: the pool is already at the trigger with
+# compaction running when the first one starts, and no rung waits for compactions.
 #
 # TWO LATTE SEMANTICS THAT READ WRONG (method.txt section 4):
 #  --concurrency IS PER THREAD. "Max number of concurrent async requests PER THREAD",
-#    so --threads 64 --concurrency 48 is **3,072 requests in flight per command**, not
-#    48, and two commands run at once. THIS WAS THE BINDING CONSTRAINT IN BUILD 6, and
-#    the reason the read command has its own read_concurrency now. That build sized the
-#    cap on an assumed ~2 ms read ("~960 in flight at 480k"); the measured read was
-#    10.787 ms, so 3,072 in flight bought only 3,072 / 10.787 ms = 284,800 op/s and the
-#    read delivered 284,451 of the 336,000 offered - Little's Law to within 0.2%. The
-#    write command, at 2 +/- 1 in flight, never came near its own cap.
-#    When latte cannot offer the rate, its reported "cycle latency" is scheduling lag
-#    and not service time: build 6's read cycle p50 was 137 SECONDS against a request
-#    latency of 10.787 ms. Read `Request latency` from the latte summary, never `Cycle
-#    latency`, whenever the offered-rate gate in the runbook's section 7 has failed.
-#    EXPECT THAT AT EVERY RUNG. The ladder is predicted to deliver ~284k of the 336k
-#    offered reads at each depth, so all three rungs fail that gate by design and the
-#    HDR percentiles Argus derives from cycle latency measure the deficit, not the
-#    cluster. The rung's own numbers come from `Request latency`.
+#    so --threads 64 --concurrency 24 is **1,536 requests in flight per command**, not
+#    24, and two commands run at once. THIS WAS THE BINDING CONSTRAINT IN BUILD 6, and the
+#    reason the read command has its own read_concurrency now. That build sized the cap on
+#    an assumed ~2 ms read; the measured read was 10.787 ms, so 3,072 in flight bought only
+#    3,072 / 10.787 ms = 284,800 op/s and the read delivered 284,451 of the 336,000 offered
+#    - Little's Law to within 0.2%.
+#    When latte cannot offer the rate, its reported "cycle latency" is scheduling lag and
+#    not service time: build 6's read cycle p50 was 137 SECONDS against a request latency
+#    of 10.787 ms. Read `Request latency` from the latte summary, never `Cycle latency`,
+#    whenever the offered-rate gate in the runbook's section 7 has failed.
+#    EXPECT THAT ON WHICHEVER RUNGS SATURATE, which is the point of this ladder. And note
+#    the second-order effect: once a rung misses its offered rate, in flight grows to the
+#    cap by definition, so even latte's `Request latency` there carries permit wait. A
+#    saturating rung's LATENCY comes from the server's coordinator_read_latency; only its
+#    THROUGHPUT is readable from latte. Build 7 rung 3 is the worked example - it reported
+#    a cycle p50 of 31.9 SECONDS while the server's coordinator read p99 was 2.46 ms
+#    (sct-uniform-build7-report.md section 2).
 #  --warmup DEFAULTS TO 1 CYCLE, which is what method.txt requires of a write-bearing
 #    run, so omitting it was already correct. It is passed explicitly on the write
 #    commands anyway: latte's default is not a contract, and a warmup measured in
@@ -35,14 +36,14 @@
 # This test is a part of the benchmark done by Aerospike
 # https://aerospike.com/files/benchmarks/aerospike-vs-scylladb-performance-and-cost-at-multi-terabyte-scale.pdf
 
-# Four steps: the first conditions the pool and is discarded, and the three that follow
-# are the measurement, at one offered load and three loader depths. The populate writes each of the 500M keys exactly once,
-# so it leaves a pool holding live data and *no garbage at all* - nothing for compaction
-# to reclaim and nothing to reclaim it from. Measuring straight off that pool reports a
-# write amplification of ~1 and a compaction cost of zero, neither of which survives
-# contact with steady state. The conditioning step overwrites - writes only, at 300k -
-# until free segments fall to logstor_compaction_trigger_threshold (~33 minutes at the
-# shipped 0.05), and then keeps going long enough for compaction, write amplification
+# Six steps: the first conditions the pool and is discarded, and the five that follow are
+# the measurement, at five offered rates. The populate writes each of the 500M keys exactly
+# once, so it leaves a pool holding live data and *no garbage at all* - nothing for
+# compaction to reclaim and nothing to reclaim it from. Measuring straight off that pool
+# reports a write amplification of ~1 and a compaction cost of zero, neither of which
+# survives contact with steady state. The conditioning step overwrites - writes only, at
+# 300k - until free segments fall to logstor_compaction_trigger_threshold (~33 minutes at
+# the shipped 0.05), and then keeps going long enough for compaction, write amplification
 # and space amplification to settle.
 #
 # wait_no_compactions: false on the first step is the point of the pair. The default
@@ -51,33 +52,87 @@
 # conditioning was meant to leave behind. With it off, the measured step starts with the
 # pool at the trigger and compaction already running.
 #
-# Argus names them 300000 (conditioning, discard) and 480000_1 / 480000_2 / 480000_3
-# (the results, in ladder order): get_sequential_throttle_steps names a step for its
-# rate and _step_names appends a counter when several share one
-# (performance_regression_gradual_grow_throughput.py:452-494). None of the three matches
-# an entry in latency-decorator-error-thresholds-steps-ent-tablets.yaml, so all resolve
-# to mixed.default, which the logstor-tablets file nulls - nothing gates latency, as in
-# build 6. See the runbook's trap 1: the ladder is the run that finally produces a
-# defensible P99 to put there, but it produces three of them.
+# THE MEASURED STEP IS A RATE LADDER, and this is the change build 8 exists to make.
+# Build 7 delivered the whole of 480k with ~16% reactor headroom, the device at depth ~26
+# per node against a knee fio puts at 60-240, and a read service time of 0.858 ms. NOTHING
+# IN THAT RUN WAS AT ITS CEILING, so the ceiling is unknown - and build 7's depth ladder
+# could not find it: at 0.858 ms even the middle rung's 1,536 permits could have carried
+# ~1.8M reads/s, so all three rungs were limited by the offered rate and the ladder
+# measured the loader rather than the cluster. sct-uniform-build7-report.md section 6
+# item 7 is the request.
 #
-# THE MEASURED STEP IS A DEPTH LADDER, and this is the change build 7 exists to make.
-# Build 6's read delivered 284,451 of 336,000 offered, and 3,072 in flight divided by
-# the measured 10.787 ms is 284,800/s - Little's Law to 0.2%. The loader's depth and the
-# cluster's service time were one equation with two unknowns and nothing varied one of
-# them. Three rungs at 3,072 / 1,536 / 512 reads in flight (read_concurrency 48 / 24 / 8
-# over 64 threads) separate them:
+# The rungs bracket where the headroom arithmetic puts the knee. cpu_busy was 83.8% at
+# 480k, so a purely rate-proportional ceiling lands near 560-580k: 480k is the known-good
+# anchor, 550k and 600k straddle the prediction, and 700k is clearly past it. Spacing is
+# 50-70k rather than 100-120k because 9-13% steps are what it takes to resolve a knee in
+# that band - at the cost of reach, since a ceiling above 700k would come back only as
+# "above 700k" and would need another run.
 #
-#   throughput flat, latency falling with depth  -> the rate is set above the device;
-#                                                   CPU or something serialised
-#   throughput rising as depth falls             -> the drive was past its knee, as the
-#                                                   fio sweep's depth curve predicts
-#   throughput falling with depth, latency flat  -> an irreducible ~10.8 ms per read,
-#                                                   which contradicts fio AND CPU
+# READ CONCURRENCY SCALES WITH THE RATE, at read_concurrency = rate / 20000. The cap is
+# meant never to bind while the cluster is healthy, and a FLAT cap is a shrinking margin as
+# the rate climbs: 1,536 permits stop binding at 4.57 ms against 336k reads but at 3.13 ms
+# against 490k, and 3.13 ms is only ~1.4x build 7's client p99. The top rung would then be
+# the one rung whose latency is contaminated by permit wait - build 7 rung 3's artifact
+# reappearing exactly where it costs the most. Scaling holds the binding threshold at
+# ~4.57 ms on every rung, so the loader's cap is a constant across the ladder and the
+# offered rate is the only thing that varies.
 #
-# The first is the prediction. Descending, so rung 1 - which is build 6's depth exactly,
-# and therefore the A/B on the engine branch - runs first and is least at risk if the run
-# dies. plans/sct-uniform-build7/README.md section 3 in the logstor-perf repo is the
-# reasoning; plans/device-fio-report.md section 7.1 item 2 is the request.
+#   rung     rate     write    read     read_conc   in flight   per node   binds above
+#   480000   480000   144000   336000      24         1,536        384       4.57 ms
+#   550000   550000   165000   385000      28         1,792        448       4.66 ms
+#   600000   600000   180000   420000      30         1,920        480       4.57 ms
+#   700000   700000   210000   490000      35         2,240        560       4.57 ms
+#
+# 550k is the one rate that is not a multiple of 20,000; 27.5 rounds to 28, which is a 2%
+# difference in a cap that is not supposed to bind at all. Whichever rungs DO saturate
+# settle at the depths in that table, and the top of the column is 560 per node - past
+# fio's knee, but fio's depth curve costs latency past the knee and not throughput, and
+# build 6's collapse was at 768 per node on a read path 24x slower at the device. So a
+# saturating rung's throughput reading stays good even though its latency reading does not.
+#
+# ASCENDING, AND THE LADDER CLOSES ON A SECOND 480k. Ascending so the 480k anchor - which
+# is build 7 rung 2 exactly, same rate and same read_concurrency 24, and therefore the A/B
+# that says this is the same cluster - runs first, while the run is least at risk, and so
+# that a saturating rung cannot leave queues or pool state that contaminate a lower one.
+# The repeat at the end is what makes 9-13% steps mean anything: pool aging over a
+# 60-minute measured phase is the same order as the steps themselves, so without a closing
+# control a monotonic drift is indistinguishable from a rate effect. If the two 480k rungs
+# agree, every difference between them is a rate effect; if they do not, the drift is
+# measured and the intermediate rungs can be corrected by it. Drop the last rung and the
+# ladder still runs - it just loses that guarantee.
+#
+# Aging should be benign either way: the 700k rung writes 210k client/s, which at RF=2
+# across 4 nodes is 105k replica writes per node per second, comfortably under the
+# conditioning step's 150k. No rung generates garbage faster than the pool already absorbed
+# for 45 minutes. The residual risk is reads stealing device budget from compaction, so
+# watch free segments across each rung - a downward trend through a rung means that rung
+# was not stationary and its numbers are not a steady state.
+#
+# TWO THINGS THIS LADDER CANNOT DISTINGUISH ON ITS OWN, both of which have to be measured
+# alongside it or the ceiling it finds is misattributed:
+#  * THE LOADER. n_loaders is 1, and at 700k it carries ~12 Gbps across two latte processes
+#    on 64 vCPUs. Build 7's whole lesson was that a ladder can measure the loader instead of
+#    the cluster, and build 7 recorded no loader CPU at all. Read loader CPU at the 480k
+#    anchor: above ~55% and every rung above it is suspect.
+#  * cpu0 ON THE DB NODES. sct-uniform-build7-report.md section 4.2.1: one ENA receive
+#    queue, pinned to cpu0, RPS fanning every packet out at the cost of an IPI each
+#    (237,844/s at 480k). Scaled to 700k that is ~256k NET_RX/s and cpu0 near 45%. Probably
+#    not saturated, but close enough that per-cpu /proc/stat for cpu0 and `ethtool -l` have
+#    to be in the capture (report section 6 item 12) or a ceiling found here cannot be told
+#    apart from the NIC's.
+#
+# Argus names the rungs 300000, 480000_1, 550000, 600000, 700000, 480000_2:
+# get_sequential_throttle_steps names a step for its rate, and _step_names appends a
+# counter only to a rate that repeats
+# (performance_regression_gradual_grow_throughput.py:451-494), which here is 480000 alone.
+# `mixed` in latency-decorator-error-thresholds-steps-ent-tablets.yaml carries 50000 /
+# 150000 / 300000 / unthrottled, so none of the new names collides with a calibrated
+# cassandra-stress entry. 480000_1 is gated by the logstor-tablets file, calibrated off
+# build 7; every other rung resolves to mixed.default, which that file nulls. Note that
+# 600000 and 700000 DO exist in the ent-tablets file under the `read` workload, at P99 read
+# 40 ms and 50 ms - irrelevant while test_mixed_gradual_increase_load is the only sub-test
+# these pipelines run, but it is now a live collision rather than a hypothetical one.
+#
 # THE CYCLE SLOT TABLE. latte derives a key from the cycle id - random distribution is
 # OFFSET + hash_range(i, ROW_COUNT), a pure function of i - and the column values are
 # derived from that key in turn, so two write runs sharing a --start-cycle replay the
@@ -87,23 +142,27 @@
 # flatteringly low** - the one number this test exists to measure. method.txt section 5
 # is the rule; these are its slots for this test.
 #
-#   300000   write       1                read     5_000_000_000
-#   480000_1 write  10_000_000_000        read    15_000_000_000
-#   480000_2 write  20_000_000_000        read    25_000_000_000
-#   480000_3 write  30_000_000_000        read    35_000_000_000
+#   300000     write              1     read   5_000_000_000
+#   480000_1   write 10_000_000_000     read  15_000_000_000
+#   550000     write 20_000_000_000     read  25_000_000_000
+#   600000     write 30_000_000_000     read  35_000_000_000
+#   700000     write 40_000_000_000     read  45_000_000_000
+#   480000_2   write 50_000_000_000     read  55_000_000_000
 #
-# Six slots for the measured steps, not two, and that is not optional: a slot may be
+# Ten slots for the measured steps, not two, and that is not optional: a slot may be
 # reused from RUN to run - logstor_format_on_startup: true reformats the pool and the
 # populate rewrites every key - but never within one pool's lifetime, which is exactly
-# what three rungs sharing a slot would do.
+# what rungs sharing a slot would do. The two 480k rungs need DIFFERENT slots for the same
+# reason, and the closing control is worthless without that: replaying the anchor's own
+# keys would hand it a pool it had already written in the same order and would measure the
+# replay rather than the drift.
 #
 # Spacing is 5e9, not method.txt's 1e9: that figure is sized for its 5-minute runs
-# (~120M cycles). A 12-minute rung consumes 336k x 720 = 2.42e8 on the read and
-# 144k x 720 = 1.04e8 on the write, so margins are >= 4.75e9. Recheck the table whenever
-# a rate or a duration changes: cycles consumed is rate x seconds. The populate needs no
-# slot of its own - it runs the
-# sequential distribution (i % ROW_COUNT), a different mapping, so it replays nothing
-# these steps do and nothing they do replays it.
+# (~120M cycles). The largest rung here is 700k, consuming 490k x 720 = 3.53e8 on the read
+# and 210k x 720 = 1.51e8 on the write, so margins are >= 4.65e9. Recheck the table
+# whenever a rate or a duration changes: cycles consumed is rate x seconds. The populate
+# needs no slot of its own - it runs the sequential distribution (i % ROW_COUNT), a
+# different mapping, so it replays nothing these steps do and nothing they do replays it.
 #
 # A REPEATED RUN TAKES A NEW SLOT. If you re-run a step against a pool an earlier run
 # already wrote, shift its slot; re-using it is exactly the replay this table prevents.
@@ -132,12 +191,6 @@
 # noise buries the lines that do matter. 100/s fills every interval, still costs
 # essentially no device budget, and moves the compaction trigger no closer.
 #
-# The offered load is deliberately unchanged at 480k / 30-70 across all three rungs:
-# section 6 puts the device-bound ceiling at ~610-650k, so 480k keeps ~25% of headroom
-# and measures the storage engine rather than saturation, and it is the rate the
-# Aerospike reference in the header uses. Only the loader's read depth varies, which is
-# what makes the three rungs comparable.
-#
 # wait_no_compactions: false on EVERY step, including the last. Between rungs it is what
 # keeps the pool at the trigger: the default drains compactions and then sleeps to 180s
 # (performance_regression_gradual_grow_throughput.py:615), handing the next rung a pool
@@ -145,33 +198,48 @@
 # rung it only skips a trailing wait, and whether compaction goes idle once the load
 # stops - the runbook's section 7 check - is visible in Grafana without it.
 #
-# The write command keeps concurrency: 48 at every rung. It held 143,998 of 144,000 at
-# 2 +/- 1 in flight in build 6 and is not a factor; only the read cap is swept.
+# The write command keeps concurrency: 48 at every rung. Writes held 143,998 of 144,000 at
+# ~2 per thread in build 7 and are not a factor: even the 700k rung needs 210,000 x ~1.0 ms
+# = ~210 in flight, ~3 per thread, and a per-thread cap of 48 against 3,281 writes/s/thread
+# does not bind until 14.6 ms. Only the read cap is sized per rung, so the write side stays
+# one fewer variable.
 perf_gradual_throttle_steps:
   mixed:
-    - {threads: 64, concurrency: 48, read_concurrency: 48,
+    - {threads: 64, concurrency: 48, read_concurrency: 24,
        rate: '300000', write_rate: '300000', read_rate: '100',
        write_start_cycle: 1, read_start_cycle: 5000000000,
        duration: '45m', wait_no_compactions: false}
-    # 3,072 reads in flight - build 6's depth exactly, so this rung is the A/B on the
-    # engine branch. Needs a read to land inside 9.14 ms to offer 336k.
-    - {threads: 64, concurrency: 48, read_concurrency: 48,
+    # The anchor: build 7 rung 2 exactly - 480k at read_concurrency 24 - which delivered
+    # 480,000 of 480,000 offered there. This is the A/B on the cluster and the only rung
+    # the threshold file gates.
+    - {threads: 64, concurrency: 48, read_concurrency: 24,
        rate: '480000', write_rate: '144000', read_rate: '336000',
        write_start_cycle: 10000000000, read_start_cycle: 15000000000,
        duration: '12m', wait_no_compactions: false}
-    # 1,536 in flight, 384 per node - the runbook's safe middle. Needs 4.57 ms.
-    - {threads: 64, concurrency: 48, read_concurrency: 24,
-       rate: '480000', write_rate: '144000', read_rate: '336000',
+    # Just under the 560-580k the headroom arithmetic predicts. 1,792 in flight, 448/node.
+    - {threads: 64, concurrency: 48, read_concurrency: 28,
+       rate: '550000', write_rate: '165000', read_rate: '385000',
        write_start_cycle: 20000000000, read_start_cycle: 25000000000,
        duration: '12m', wait_no_compactions: false}
-    # 512 in flight, 128 per node - inside the drive's own knee, which the fio sweep
-    # puts at depth 60-240 per node. Needs 1.52 ms.
-    - {threads: 64, concurrency: 48, read_concurrency: 8,
-       rate: '480000', write_rate: '144000', read_rate: '336000',
+    # Just over it. 1,920 in flight, 480/node.
+    - {threads: 64, concurrency: 48, read_concurrency: 30,
+       rate: '600000', write_rate: '180000', read_rate: '420000',
        write_start_cycle: 30000000000, read_start_cycle: 35000000000,
        duration: '12m', wait_no_compactions: false}
+    # Clearly past it, and the rung that says what the plateau is worth. 2,240 in flight,
+    # 560/node - the deepest the ladder goes, and still well below build 6's 768.
+    - {threads: 64, concurrency: 48, read_concurrency: 35,
+       rate: '700000', write_rate: '210000', read_rate: '490000',
+       write_start_cycle: 40000000000, read_start_cycle: 45000000000,
+       duration: '12m', wait_no_compactions: false}
+    # The closing control: the anchor again, on fresh cycle slots. Agreement with it is
+    # what licenses reading the 9-13% gaps above as rate effects rather than drift.
+    - {threads: 64, concurrency: 48, read_concurrency: 24,
+       rate: '480000', write_rate: '144000', read_rate: '336000',
+       write_start_cycle: 50000000000, read_start_cycle: 55000000000,
+       duration: '12m', wait_no_compactions: false}
 
-# Fallback for a step that does not carry its own duration; all four above do.
+# Fallback for a step that does not carry its own duration; all six above do.
 perf_gradual_step_duration: {"mixed": '60m'}
 
 # No cache warmup for uniform workload (data is uniformly distributed, no hot set)
