@@ -27,41 +27,46 @@
 # window is folded into one histogram whose percentiles become the "P90 read" / "P99 write"
 # columns, in ms (sdcm/utils/hdrhistogram.py:453). That is NOT the figure
 # sct-uniform-build7-report.md section 5 quotes - the report's 2.310 ms is the median of
-# the per-second p99s, which deliberately discards the bad seconds. The numbers below were
-# recomputed from build 7 rung 2's own .hdr files the way Argus folds them:
+# the per-second p99s, which deliberately discards the bad seconds.
 #
-#   build 7 rung 2 (480k, read_concurrency 24), full-step aggregate, ms
-#                p50     p90     p95      p99     p99.9
-#     read      0.86    1.39    1.75   402.39   1180.70
-#     write     1.00    1.46    1.63     2.20      5.31
+# It is also not what build 8 will produce, because logstor_uniform_queries.yaml now gives
+# the read command `--warmup 15s`. Every read rung in build 7 opened with a client-side
+# scheduling backlog - latte delivering 240-260k/s against an offered 336k for five seconds
+# while cycle latency climbed to 1.17 s, settling by t=10-15s - and those seconds are ~1.4%
+# of the step's read samples, just over the p99 boundary. latte excludes the warmup phase
+# from --hdrfile (src/main.rs passes `&mut None` for it), so a warmup moves that backlog out
+# of the histogram Argus folds. The read limits below are therefore calibrated on build 7
+# rung 2's own .hdr file folded from t=15s - the histogram Argus WOULD have produced had the
+# warmup been in place - and cross-checked against rung 1:
 #
+#   build 7, 480k, aggregate from t=15s (what --warmup 15s leaves), ms
+#                p50     p90     p95     p99    p99.9        full-step p99, for contrast
+#     read      0.85    1.34    1.61    2.62     6.60              402.39
+#     rung 1    0.87    1.37    1.65    2.64     5.02              931.14
+#     write     1.00    1.44    1.59    1.93     2.54                2.20
+#
+# The two rungs agree to 1% on p99 read and the value is flat from t=15s out to t=60s
+# (2.617 -> 2.638), so it is a property of the workload and not of where the window was cut.
 # Threshold = that figure + ~25% for run-to-run variance, the convention the
-# lwt-heavy-tablets file follows.
+# lwt-heavy-tablets file follows: P99 read 3.3, P90 read 1.75.
 #
-# P99 READ IS LEFT NULL ON PURPOSE, and 402.39 ms is why. The read command's first ten
-# seconds of every rung are a cold start, not a steady state: cycle p50 climbs 0.18 -> 1.17
-# seconds over six seconds while latte delivers 240k-260k/s against an offered 336k, then
-# over-fires to 461k/s draining the backlog, and from t=10s the rung is clean at 336k/s with
-# a per-second p99 of 2.0-2.9 ms. Those ten seconds are ~3.4M of the step's 241.9M read
-# samples - **1.4%**, just over the p99 boundary - so the aggregate p99 lands *inside* the
-# transient and is pinned there. It would not move if steady-state p99 doubled, or
-# decupled; it only moves if the cold start itself changes. A threshold on it would gate
-# nothing, which is worse than gating nothing openly. Excluding the first 60 s the same
-# histogram gives p99 read **2.64 ms**, and that is the number to put here the day the
-# transient is excluded at the source - the read command takes latte's default 1-cycle
-# warmup today, and a duration warmup on the READ command only is safe on exactly the
-# grounds logstor_uniform_queries.yaml gives for refusing one on the write commands (a
-# replayed read rewrites nothing, so it cannot distort write amplification).
+# P99 WRITE IS DELIBERATELY LOOSE AT 3.5, AND IS THE ONE NUMBER HERE THAT IS PART ESTIMATE.
+# The write command does not warm up - latte's warmup is unthrottled (`rate: None`) and
+# replays its own cycles into the measured run, which is disqualifying for a write command
+# and inert for a read one, as logstor_uniform_queries.yaml sets out. So the write keeps a
+# measured window that starts at t=0, and that window now contains the read command's
+# 15 seconds of UNTHROTTLED reads where build 7 had the read command's throttled ramp. Build
+# 7's own full-step p99 write was 2.202 (rung 2) and 2.527 (rung 1), whose steady state is
+# 1.93 in both; +25% on the worse of them is 3.16, rounded to 3.5 to absorb a heavier first
+# 15 seconds that cannot be measured from build 7. Re-tighten it from build 8's own anchor
+# rung - it should come back near 2.4.
 #
-# P90 read is the gate that does work. At 1.39 ms full-step against 1.35 ms excluding the
-# transient, it is untouched by the cold start - 1.4% of samples cannot reach the 10%
-# mark. It also catches an offered-rate failure loudly, which is the failure this workload
-# actually has a history of: build 6's measured step folds to a read p90 of **249
-# seconds**, because a rate deficit turns latte's cycle latency into scheduling lag.
-#
-# Both writes are gatable as they stand. The write command has no equivalent burst: it
-# holds 144k/s from t=0 and its first ten seconds cost latency (p50 ~3 ms) but not
-# scheduling, which moves full-step p99 write only from 1.94 to 2.20 ms.
+# P90 is immune to all of this on both sides and needs no allowance: 1.4-2% of samples
+# cannot reach the 10% mark. Build 7's p90 read moves only 1.39 -> 1.34 when the transient
+# is excluded, and p90 write 1.456 -> 1.437. P90 read also catches an offered-rate failure
+# loudly, which is the failure this workload actually has a history of: build 6's measured
+# step folds to a read p90 of **249 seconds**, because a rate deficit turns latte's cycle
+# latency into scheduling lag.
 
 latency_decorator_error_thresholds:
   mixed:
@@ -110,9 +115,9 @@ latency_decorator_error_thresholds:
         fixed_limit: 1.75
       P90 write:
         fixed_limit: 1.85
-      # Null by construction, not by omission - see the header.
       P99 read:
-        fixed_limit: null
+        fixed_limit: 3.3
+      # Part estimate - see the header. Re-tighten from build 8's own anchor.
       P99 write:
-        fixed_limit: 2.75
+        fixed_limit: 3.5
     "480000": *logstor_480k

@@ -29,10 +29,41 @@
 #    THROUGHPUT is readable from latte. Build 7 rung 3 is the worked example - it reported
 #    a cycle p50 of 31.9 SECONDS while the server's coordinator read p99 was 2.46 ms
 #    (sct-uniform-build7-report.md section 2).
-#  --warmup DEFAULTS TO 1 CYCLE, which is what method.txt requires of a write-bearing
-#    run, so omitting it was already correct. It is passed explicitly on the write
-#    commands anyway: latte's default is not a contract, and a warmup measured in
-#    seconds would replay the head of the measured stream if the counter restarts.
+#  --warmup DEFAULTS TO 1 CYCLE, i.e. to nothing. The read command now takes 15s and the
+#    write commands keep 1, and all three of latte's warmup semantics were read out of
+#    latte 0.50.0-scylladb's own src/main.rs before choosing that split:
+#      * THE WARMUP IS EXCLUDED FROM --hdrfile. par_execute gets `&mut None` for the
+#        warmup phase and `&mut Some(boxed_hdrh_writer)` for the run. This is the whole
+#        reason the read command has one - see below.
+#      * THE WARMUP IS UNTHROTTLED. warmup_options sets `rate: None` while carrying the
+#        same --threads and --concurrency, so it runs flat out for its duration. That is
+#        what keeps it to 15 seconds and what keeps it off the write commands.
+#      * THE MAIN RUN REPLAYS THE WARMUP'S CYCLES. Both phases take
+#        `cycle_range: (conf.start_cycle, conf.end_cycle)`, so the counter does not carry
+#        over - the run re-issues the ids the warmup just issued. The header of the slot
+#        table below says why that is disqualifying for a write command: an unthrottled
+#        write warmup would lay down several million records and the measured run would
+#        kill them front to back within its first half-minute, which is precisely the
+#        correlated-death pattern the slot table exists to prevent, and it would make that
+#        garbage at an uncontrolled rate right before a steady-state measurement. For a
+#        READ command it is inert: a replayed read rewrites nothing, and BYPASS CACHE means
+#        it does not even warm a cache. So the asymmetry is not an oversight.
+#    15s IS SIZED ON BUILD 7, AND IT BUYS THE P99. Every read rung in that build opened
+#    with a client-side scheduling backlog: latte delivered 240-260k/s against an offered
+#    336k for five seconds while cycle latency climbed 0.18 -> 1.17 s, then over-fired to
+#    461k/s draining it, and settled by t=10-15s. The deficit and the latency agree to
+#    within 3% - 381k cycles behind at t=5s is 1.13 s at 336k/s - so it is the loader
+#    ramping its pools, not the cluster. Those seconds are ~1.4% of a 12m rung's read
+#    samples, just over the p99 boundary, which put build 7's full-step p99 read at
+#    402 ms against a steady-state 2.62. Folding rung 1 and rung 2's own histograms from
+#    t=15s gives p99 2.644 and 2.617 and the value is flat out to t=60s, so 15s covers the
+#    worst observed ramp with margin and is what
+#    latency-decorator-error-thresholds-logstor-tablets.yaml now gates on.
+#    Two consequences worth knowing. The conditioning step shares this template, so it too
+#    pays 15s of unthrottled reads against its read_rate of 100 - ~7.5M reads out of a 45m
+#    write-dominated step that is discarded anyway. And the write command, which does not
+#    warm up, has the read's unthrottled warmup inside the first 15s of its own measured
+#    window; that is why its P99 threshold is set loose and flagged for re-tightening.
 # This test is a part of the benchmark done by Aerospike
 # https://aerospike.com/files/benchmarks/aerospike-vs-scylladb-performance-and-cost-at-multi-terabyte-scale.pdf
 
@@ -292,7 +323,7 @@ stress_cmd_m:
   - >-
     latte run --function read --consistency ONE --duration $duration
     --threads $threads --concurrency $read_concurrency --rate $read_rate
-    --start-cycle $read_start_cycle
+    --start-cycle $read_start_cycle --warmup 15s
     -P row_count=500000000 -P offset=0 -P distribution=\"random\"
     -P column_count=10 -P column_size=200 -P key_size=48 -P bypass_cache=true
     data_dir/latte/latte_cs_alike.rn
