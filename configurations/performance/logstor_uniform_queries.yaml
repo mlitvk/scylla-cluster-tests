@@ -5,9 +5,9 @@
 # over an unbounded cycle range (no --end-cycle) so the key sequence never repeats within the run.
 # Schema: 10 columns x 200 bytes each (matching kv_uniform.rn reference)
 # Reads use BYPASS CACHE, so a read is served by the storage engine and not the row cache
-# Mixed (write:30,read:70) as a FIVE-RUNG RATE LADDER - 480k / 550k / 600k / 700k / 480k,
-# 12m per rung - after a 45m write-only conditioning step at 300k that brings the pool to
-# the compaction trigger. Every rung is stationary: the pool is already at the trigger with
+# Mixed (write:30,read:70) as a FIVE-RUNG NETWORK LADDER - the SAME 480k on every rung,
+# 12m each - after a 45m write-only conditioning step at 300k that brings the pool to the
+# compaction trigger. Every rung is stationary: the pool is already at the trigger with
 # compaction running when the first one starts, and no rung waits for compactions.
 #
 # TWO LATTE SEMANTICS THAT READ WRONG (method.txt section 4):
@@ -83,86 +83,71 @@
 # conditioning was meant to leave behind. With it off, the measured step starts with the
 # pool at the trigger and compaction already running.
 #
-# THE MEASURED STEP IS A RATE LADDER, and this is the change build 8 exists to make.
-# Build 7 delivered the whole of 480k with ~16% reactor headroom, the device at depth ~26
-# per node against a knee fio puts at 60-240, and a read service time of 0.858 ms. NOTHING
-# IN THAT RUN WAS AT ITS CEILING, so the ceiling is unknown - and build 7's depth ladder
-# could not find it: at 0.858 ms even the middle rung's 1,536 permits could have carried
-# ~1.8M reads/s, so all three rungs were limited by the offered rate and the ladder
-# measured the loader rather than the cluster. sct-uniform-build7-report.md section 6
-# item 7 is the request.
+# THE MEASURED STEP IS A NETWORK LADDER, and this is the change build 8 exists to make.
+# THE ENGINE IS A CONSTANT for the first time in this series: same commit, same AMI, same
+# 480,000 client ops/s and same read_concurrency 24 on all five rungs, and the only thing
+# that changes between them is the network path. Nothing here is set in this file - every
+# rung's configuration is applied from OUTSIDE, by plans/sct-uniform-build8/rung-driver.sh
+# on the SCT runner, because SCT has no hook between steps. This file's job is to provide
+# five identical measured steps on disjoint cycle slots.
 #
-# The rungs bracket where the headroom arithmetic puts the knee. cpu_busy was 83.8% at
-# 480k, so a purely rate-proportional ceiling lands near 560-580k: 480k is the known-good
-# anchor, 550k and 600k straddle the prediction, and 700k is clearly past it. Spacing is
-# 50-70k rather than 100-120k because 9-13% steps are what it takes to resolve a knee in
-# that band - at the cost of reach, since a ceiling above 700k would come back only as
-# "above 700k" and would need another run.
+#   rung  configuration                                     what it isolates
+#   R0    as provisioned (one Rx queue, RPS on, MTU 1500)    the anchor: it must reproduce
+#                                                            build 7 rung 2 or nothing
+#                                                            after it is interpretable
+#   R1    ethtool -L combined <max>, one queue IRQ per       the per-packet IPI and the
+#         core, RPS off, XPS aligned                         backlog hop - the headline
+#   R2    R1 + ethtool -C adaptive-rx on                     NAPI batching
+#   R3    R2 + MTU 9001 on the db nodes AND the loader       a third fewer wire frames
+#   R4    whichever of the above won, chosen at runtime      the far tail, with an off-CPU
+#                                                            capture, and a repeat control
 #
-# READ CONCURRENCY SCALES WITH THE RATE, at read_concurrency = rate / 20000. The cap is
-# meant never to bind while the cluster is healthy, and a FLAT cap is a shrinking margin as
-# the rate climbs: 1,536 permits stop binding at 4.57 ms against 336k reads but at 3.13 ms
-# against 490k, and 3.13 ms is only ~1.4x build 7's client p99. The top rung would then be
-# the one rung whose latency is contaminated by permit wait - build 7 rung 3's artifact
-# reappearing exactly where it costs the most. Scaling holds the binding threshold at
-# ~4.57 ms on every rung, so the loader's cap is a constant across the ladder and the
-# offered rate is the only thing that varies.
+# WHY THE NETWORK. sct-uniform-build7-report.md section 4.2.1: the NIC presents ONE receive
+# queue, its hard IRQ pinned to cpu0, and RPS then hands every packet to its destination
+# shard core at the cost of one function-call IPI plus a NET_RX softirq on the destination.
+# Under the measured load that is 11,216 IPIs and 9,729 NET_RX raises per shard core per
+# second, and 9.8% of every shard core in softirq. It preempts the reactor at points
+# seastar cannot see - its steal metric reads 0.0% while the same cores lose ~10-12% to
+# softirq - and it barely moves p50, which is the signature of a p99 tax.
 #
-#   rung     rate     write    read     read_conc   in flight   per node   binds above
-#   480000   480000   144000   336000      24         1,536        384       4.57 ms
-#   550000   550000   165000   385000      28         1,792        448       4.66 ms
-#   600000   600000   180000   420000      30         1,920        480       4.57 ms
-#   700000   700000   210000   490000      35         2,240        560       4.57 ms
+# AND THE SINGLE QUEUE IS PERFTUNE'S, NOT THE INSTANCE'S. seastar/scripts/perftune.py:1333
+# sets the Rx channel count to popcount(irq_cpu_mask), and the auto-detected mask for a
+# 16-core machine is core:0 alone (:317, `num_cores <= cores_per_irq_core`, 16 <= 16). So
+# perftune ran `ethtool -L eth0 combined 1` on these nodes, one core below the threshold at
+# which it would have allocated a second IRQ core. R1 undoes that decision by hand; if it
+# wins, the durable fix is a perftune setting and not an ethtool invocation.
 #
-# 550k is the one rate that is not a multiple of 20,000; 27.5 rounds to 28, which is a 2%
-# difference in a cap that is not supposed to bind at all. Whichever rungs DO saturate
-# settle at the depths in that table, and the top of the column is 560 per node - past
-# fio's knee, but fio's depth curve costs latency past the knee and not throughput, and
-# build 6's collapse was at 768 per node on a read path 24x slower at the device. So a
-# saturating rung's throughput reading stays good even though its latency reading does not.
+# READ CONCURRENCY IS 24 ON EVERY RUNG, and this ladder is the reason a flat cap is right
+# where the rate ladder needed a scaled one: the offered rate never changes, so 1,536 in
+# flight (384 per node) stays ~5x the observed in-flight need of ~288 and stops binding
+# only above 4.57 ms. It is build 7 rung 2 exactly, which is what makes R0 an A/B against
+# that run rather than a new measurement.
 #
-# ASCENDING, AND THE LADDER CLOSES ON A SECOND 480k. Ascending so the 480k anchor - which
-# is build 7 rung 2 exactly, same rate and same read_concurrency 24, and therefore the A/B
-# that says this is the same cluster - runs first, while the run is least at risk, and so
-# that a saturating rung cannot leave queues or pool state that contaminate a lower one.
-# The repeat at the end is what makes 9-13% steps mean anything: pool aging over a
-# 60-minute measured phase is the same order as the steps themselves, so without a closing
-# control a monotonic drift is indistinguishable from a rate effect. If the two 480k rungs
-# agree, every difference between them is a rate effect; if they do not, the drift is
-# measured and the intermediate rungs can be corrected by it. Drop the last rung and the
-# ladder still runs - it just loses that guarantee.
+# WHAT THE LADDER CANNOT DISTINGUISH ON ITS OWN, and what is captured alongside it:
+#  * A LINK BOUNCE LANDS IN THE NEXT RUNG. `ethtool -L` resets the interface for 2-5 s and
+#    `wait_no_compactions: false` leaves NO gap between steps - the loop at
+#    performance_regression_gradual_grow_throughput.py:613-615 skips both the drain and the
+#    180 s sleep, and build 7 rungs started exactly 720 s apart. So R1 and R3 open with
+#    reconnections, and their Argus aggregates carry them. The report quotes 62-second
+#    windows taken FOUR MINUTES in, and per-second series from t=60s, both of which are
+#    clear of it. R0 is untouched: nothing is applied before it.
+#  * THE FAR TAIL IS A SEPARATE PHENOMENON and is measured separately. ~9.4% of build 7
+#    steady-state seconds carried a read max at or past 50 ms and six per rung reached
+#    100 ms, against a p99.9 of 3-4 ms. Per-second samplers on all four nodes and the
+#    loader, plus R4 sched_switch and softirq tracing, are what address it; see
+#    plans/sct-uniform-build8/execute.md sections 0.2-0.4.
 #
-# Aging should be benign either way: the 700k rung writes 210k client/s, which at RF=2
-# across 4 nodes is 105k replica writes per node per second, comfortably under the
-# conditioning step's 150k. No rung generates garbage faster than the pool already absorbed
-# for 45 minutes. The residual risk is reads stealing device budget from compaction, so
-# watch free segments across each rung - a downward trend through a rung means that rung
-# was not stationary and its numbers are not a steady state.
-#
-# TWO THINGS THIS LADDER CANNOT DISTINGUISH ON ITS OWN, both of which have to be measured
-# alongside it or the ceiling it finds is misattributed:
-#  * THE LOADER. n_loaders is 1, and at 700k it carries ~12 Gbps across two latte processes
-#    on 64 vCPUs. Build 7's whole lesson was that a ladder can measure the loader instead of
-#    the cluster, and build 7 recorded no loader CPU at all. Read loader CPU at the 480k
-#    anchor: above ~55% and every rung above it is suspect.
-#  * cpu0 ON THE DB NODES. sct-uniform-build7-report.md section 4.2.1: one ENA receive
-#    queue, pinned to cpu0, RPS fanning every packet out at the cost of an IPI each
-#    (237,844/s at 480k). Scaled to 700k that is ~256k NET_RX/s and cpu0 near 45%. Probably
-#    not saturated, but close enough that per-cpu /proc/stat for cpu0 and `ethtool -l` have
-#    to be in the capture (report section 6 item 12) or a ceiling found here cannot be told
-#    apart from the NIC's.
-#
-# Argus names the rungs 300000, 480000_1, 550000, 600000, 700000, 480000_2:
-# get_sequential_throttle_steps names a step for its rate, and _step_names appends a
-# counter only to a rate that repeats
-# (performance_regression_gradual_grow_throughput.py:451-494), which here is 480000 alone.
-# `mixed` in latency-decorator-error-thresholds-steps-ent-tablets.yaml carries 50000 /
-# 150000 / 300000 / unthrottled, so none of the new names collides with a calibrated
-# cassandra-stress entry. 480000_1 is gated by the logstor-tablets file, calibrated off
-# build 7; every other rung resolves to mixed.default, which that file nulls. Note that
-# 600000 and 700000 DO exist in the ent-tablets file under the `read` workload, at P99 read
-# 40 ms and 50 ms - irrelevant while test_mixed_gradual_increase_load is the only sub-test
-# these pipelines run, but it is now a live collision rather than a hypothetical one.
+# Argus names the rungs 300000, 480000_1, 480000_2, 480000_3, 480000_4, 480000_5:
+# get_sequential_throttle_steps names a step for its rate and _step_names appends a counter
+# to a rate that repeats (performance_regression_gradual_grow_throughput.py:451-494), and
+# here every measured rung shares 480000. `mixed` in
+# latency-decorator-error-thresholds-steps-ent-tablets.yaml carries 50000 / 150000 / 300000
+# / unthrottled, so none of these names collides with a calibrated cassandra-stress entry.
+# 480000_1 - the anchor - is gated by the logstor-tablets file, calibrated off build 7;
+# 480000_2..5 resolve to mixed.default, which that file nulls. That split is deliberate:
+# gating the anchor IS the "R0 must reproduce build 7" check, and leaving the four
+# experimental rungs ungated means a rung that changes the tail cannot fail the job for
+# changing it.
 #
 # THE CYCLE SLOT TABLE. latte derives a key from the cycle id - random distribution is
 # OFFSET + hash_range(i, ROW_COUNT), a pure function of i - and the column values are
@@ -173,24 +158,26 @@
 # flatteringly low** - the one number this test exists to measure. method.txt section 5
 # is the rule; these are its slots for this test.
 #
-#   300000     write              1     read   5_000_000_000
-#   480000_1   write 10_000_000_000     read  15_000_000_000
-#   550000     write 20_000_000_000     read  25_000_000_000
-#   600000     write 30_000_000_000     read  35_000_000_000
-#   700000     write 40_000_000_000     read  45_000_000_000
-#   480000_2   write 50_000_000_000     read  55_000_000_000
+#   300000          write              1     read   5_000_000_000
+#   480000_1  R0    write 10_000_000_000     read  15_000_000_000
+#   480000_2  R1    write 20_000_000_000     read  25_000_000_000
+#   480000_3  R2    write 30_000_000_000     read  35_000_000_000
+#   480000_4  R3    write 40_000_000_000     read  45_000_000_000
+#   480000_5  R4    write 50_000_000_000     read  55_000_000_000
 #
 # Ten slots for the measured steps, not two, and that is not optional: a slot may be
 # reused from RUN to run - logstor_format_on_startup: true reformats the pool and the
 # populate rewrites every key - but never within one pool's lifetime, which is exactly
-# what rungs sharing a slot would do. The two 480k rungs need DIFFERENT slots for the same
-# reason, and the closing control is worthless without that: replaying the anchor's own
-# keys would hand it a pool it had already written in the same order and would measure the
-# replay rather than the drift.
+# what rungs sharing a slot would do. FIVE RUNGS AT THE SAME RATE MAKE THIS STRICTER, NOT
+# LOOSER: identical rates on a shared slot would replay an identical key stream, so each
+# rung would kill its predecessor's records front to back and every rung after the first
+# would measure a bimodal segment population instead of steady state. It is also what makes
+# R4 usable as a repeat control - replaying the winner's own keys would measure the replay
+# rather than the drift.
 #
 # Spacing is 5e9, not method.txt's 1e9: that figure is sized for its 5-minute runs
-# (~120M cycles). The largest rung here is 700k, consuming 490k x 720 = 3.53e8 on the read
-# and 210k x 720 = 1.51e8 on the write, so margins are >= 4.65e9. Recheck the table
+# (~120M cycles). Every rung here consumes 336k x 720 = 2.42e8 on the read and
+# 144k x 720 = 1.04e8 on the write, so margins are >= 4.76e9. Recheck the table
 # whenever a rate or a duration changes: cycles consumed is rate x seconds. The populate
 # needs no slot of its own - it runs the sequential distribution (i % ROW_COUNT), a
 # different mapping, so it replays nothing these steps do and nothing they do replays it.
@@ -240,31 +227,34 @@ perf_gradual_throttle_steps:
        rate: '300000', write_rate: '300000', read_rate: '100',
        write_start_cycle: 1, read_start_cycle: 5000000000,
        duration: '45m', wait_no_compactions: false}
-    # The anchor: build 7 rung 2 exactly - 480k at read_concurrency 24 - which delivered
-    # 480,000 of 480,000 offered there. This is the A/B on the cluster and the only rung
-    # the threshold file gates.
+    # R0, Argus 480000_1 - the anchor, as provisioned. Build 7 rung 2 exactly: same rate,
+    # same read_concurrency 24, which delivered 480,000 of 480,000 offered at a coordinator
+    # read p99 of 1.471 ms. The only rung the threshold file gates, and nothing is applied
+    # to the network before it.
     - {threads: 64, concurrency: 48, read_concurrency: 24,
        rate: '480000', write_rate: '144000', read_rate: '336000',
        write_start_cycle: 10000000000, read_start_cycle: 15000000000,
        duration: '12m', wait_no_compactions: false}
-    # Just under the 560-580k the headroom arithmetic predicts. 1,792 in flight, 448/node.
-    - {threads: 64, concurrency: 48, read_concurrency: 28,
-       rate: '550000', write_rate: '165000', read_rate: '385000',
+    # R1, Argus 480000_2 - multi-queue, RPS off. The headline hypothesis.
+    - {threads: 64, concurrency: 48, read_concurrency: 24,
+       rate: '480000', write_rate: '144000', read_rate: '336000',
        write_start_cycle: 20000000000, read_start_cycle: 25000000000,
        duration: '12m', wait_no_compactions: false}
-    # Just over it. 1,920 in flight, 480/node.
-    - {threads: 64, concurrency: 48, read_concurrency: 30,
-       rate: '600000', write_rate: '180000', read_rate: '420000',
+    # R2, Argus 480000_3 - R1 plus receive coalescing.
+    - {threads: 64, concurrency: 48, read_concurrency: 24,
+       rate: '480000', write_rate: '144000', read_rate: '336000',
        write_start_cycle: 30000000000, read_start_cycle: 35000000000,
        duration: '12m', wait_no_compactions: false}
-    # Clearly past it, and the rung that says what the plateau is worth. 2,240 in flight,
-    # 560/node - the deepest the ladder goes, and still well below build 6's 768.
-    - {threads: 64, concurrency: 48, read_concurrency: 35,
-       rate: '700000', write_rate: '210000', read_rate: '490000',
+    # R3, Argus 480000_4 - R2 plus MTU 9001, on the loader as well as the db nodes.
+    - {threads: 64, concurrency: 48, read_concurrency: 24,
+       rate: '480000', write_rate: '144000', read_rate: '336000',
        write_start_cycle: 40000000000, read_start_cycle: 45000000000,
        duration: '12m', wait_no_compactions: false}
-    # The closing control: the anchor again, on fresh cycle slots. Agreement with it is
-    # what licenses reading the 9-13% gaps above as rate effects rather than drift.
+    # R4, Argus 480000_5 - whichever configuration won, chosen at runtime by writing it
+    # into /tmp/r4-config on the runner; empty means keep R3, so the default costs no
+    # transition. It carries the off-CPU capture (sched_switch, softirq entry/exit) that the
+    # other rungs cannot afford beside their own profile, and it doubles as the ladder's
+    # only repeat control against drift over a 60-minute measured phase.
     - {threads: 64, concurrency: 48, read_concurrency: 24,
        rate: '480000', write_rate: '144000', read_rate: '336000',
        write_start_cycle: 50000000000, read_start_cycle: 55000000000,

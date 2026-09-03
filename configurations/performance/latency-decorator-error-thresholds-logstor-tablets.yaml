@@ -99,17 +99,23 @@ latency_decorator_error_thresholds:
     # The 480k anchor, calibrated off Jenkins build 7 (test_id
     # 39c980df-67d4-4c4e-ad7e-8a3ae14ee12a, 4 x i4g.4xlarge, logstor_perf @ 14f2483ff5),
     # rung 2 - the same rate at the same read_concurrency 24, which delivered 480,000 of
-    # 480,000 offered. It is the only rung of the ladder with a directly comparable
-    # predecessor, so it is the only one gated; 550000 / 600000 / 700000 are exploratory
-    # and inherit the nulled default.
+    # 480,000 offered.
     #
-    # Two keys, one set of limits. get_sequential_throttle_steps names the anchor
-    # `480000_1` while the ladder closes on a second 480k rung, and plain `480000` if that
-    # closing rung is ever dropped (_step_names appends a counter only to a repeated rate).
-    # Carrying both means the gate survives either shape rather than silently lapsing.
-    # `480000_2` is deliberately absent: the closing control runs after 36 minutes of
-    # higher load and exists to MEASURE drift, so failing the job on it would throw away
-    # the reading it was added to take.
+    # BUILD 8 IS A NETWORK LADDER, so all five measured rungs run at 480000 and Argus names
+    # them 480000_1..480000_5. Only `480000_1` is gated, and that is the whole point: R0 is
+    # the as-provisioned anchor, and gating it IS the "R0 must reproduce build 7 or nothing
+    # after it is interpretable" check, mechanised. `480000_2`..`480000_5` are the four
+    # experimental rungs and are deliberately absent: they change the network path in order
+    # to change the tail, so failing the job on a rung for moving the number it was added to
+    # move would throw away the reading. They inherit the nulled default.
+    #
+    # A red build is a RESULT here, not a lost run: FailedResultEvent is an
+    # InformationalEvent (sdcm/sct_events/system.py:362), so a drifting R0 colours the job
+    # and the ladder still runs to the end.
+    #
+    # Plain `480000` carries the same limits so the gate survives a shape with a single
+    # measured rung - _step_names appends a counter only to a repeated rate - rather than
+    # silently lapsing.
     "480000_1": &logstor_480k
       P90 read:
         fixed_limit: 1.75
