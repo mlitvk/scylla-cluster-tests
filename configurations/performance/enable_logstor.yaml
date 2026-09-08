@@ -48,8 +48,39 @@ append_scylla_yaml:
   # of the live switch it was on.
   logstor_direct_writes_enabled: true
 
-# Append --task-quota-ms 0.2 to existing append_scylla_args (++ prefix appends instead of replacing)
-append_scylla_args: '++ --task-quota-ms 0.2'
+# Appended to the existing append_scylla_args - the `++` prefix appends instead of
+# replacing, so whatever the base test-case sets is kept.
+#
+# --task-quota-ms 0.2 is unchanged and must stay there: plans/io-sched-sim.py prices
+# 0.5 at nearly DOUBLE the p99 io-queue delay of 0.2 (467 vs 250 us) because task
+# batches then run up to 500 us. Raising it is the one thing the simulation rules out
+# most loudly.
+#
+# --io-latency-goal-ms 1.0 is BUILD 9's CHANGE, and it is not a device setting. Seastar
+# defaults it to 1.5 x task-quota-ms (reactor.cc:4038), i.e. 0.3 ms here, and the goal
+# divided by the shard count is the per-grab token allowance a shard may reserve. At
+# 0.3/15 = 20.0 us a single 128 KiB compaction read needs several reservation rounds,
+# and WHILE IT DOES THE SHARD DISPATCHES NOTHING - a queued 8 KiB foreground read
+# included. 1.0/15 = 66.7 us takes that reservation in one round.
+#
+# plans/io-sched-sim.py, 376,336 foreground reads per scenario, foreground read
+# io-queue delay in microseconds:
+#
+#     scenario                       p90     p99   p99.9     max
+#     baseline (build 7 rung 2)    157.1   250.4   711.3  2632.4
+#     compaction removed entirely  148.4   201.6   312.7   928.6
+#     --io-latency-goal-ms 1.0     145.7   199.2   205.5   479.0
+#
+# It beats removing compaction altogether, because it removes the MECHANISM by which
+# compaction hurts reads rather than compaction's load. rho stays 0.804 and device
+# depth moves 25 -> 27, so the total dispatch rate and the device's load are unchanged:
+# what changes is the granularity of reservation. That is why it is nearly free.
+#
+# A LOST FLAG IS INVISIBLE IN EVERY METRIC - the cluster simply behaves like build 8
+# with a new engine - so plans/sct-uniform-build9/preflight.sh greps both out of
+# `pgrep -a scylla` on all four nodes before the first measured rung, and the run stops
+# if either is missing.
+append_scylla_args: '++ --task-quota-ms 0.2 --io-latency-goal-ms 1.0'
 
 n_db_nodes: 4
 n_loaders: 1

@@ -29,7 +29,7 @@
 # sct-uniform-build7-report.md section 5 quotes - the report's 2.310 ms is the median of
 # the per-second p99s, which deliberately discards the bad seconds.
 #
-# It is also not what build 8 will produce, because logstor_uniform_queries.yaml now gives
+# It is also not what builds 8 and 9 produce, because logstor_uniform_queries.yaml gives
 # the read command `--warmup 15s`. Every read rung in build 7 opened with a client-side
 # scheduling backlog - latte delivering 240-260k/s against an offered 336k for five seconds
 # while cycle latency climbed to 1.17 s, settling by t=10-15s - and those seconds are ~1.4%
@@ -101,16 +101,37 @@ latency_decorator_error_thresholds:
     # rung 2 - the same rate at the same read_concurrency 24, which delivered 480,000 of
     # 480,000 offered.
     #
-    # BUILD 8 IS A NETWORK LADDER, so all five measured rungs run at 480000 and Argus names
-    # them 480000_1..480000_5. Only `480000_1` is gated, and that is the whole point: R0 is
-    # the as-provisioned anchor, and gating it IS the "R0 must reproduce build 7 or nothing
-    # after it is interpretable" check, mechanised. `480000_2`..`480000_5` are the four
-    # experimental rungs and are deliberately absent: they change the network path in order
-    # to change the tail, so failing the job on a rung for moving the number it was added to
-    # move would throw away the reading. They inherit the nulled default.
+    # BUILD 9 IS A RATE LADDER at 400 / 480 / 560 / 640 / 480 / 480k, so Argus names the
+    # seven steps 300000, 400000, 480000_1, 560000, 640000, 480000_2, 480000_3:
+    # get_sequential_throttle_steps names a step for its rate and _step_names appends a
+    # counter only to a rate that REPEATS (performance_regression_gradual_grow_throughput.py
+    # :451-494), and here only 480000 repeats. ADDING A RUNG CHANGES STEP NAMES - the whole
+    # reason this comment exists - so check this mapping against the yaml whenever the
+    # ladder changes, because a gate that has quietly stopped binding looks exactly like a
+    # gate that passed.
+    #
+    # ONLY `480000_1` IS GATED, and that is the whole point: B1 is the anchor, the rung run
+    # at build 8 R0's rate, mix and read_concurrency, and gating it IS the "B1 must
+    # reproduce build 8 or nothing after it is interpretable" check, mechanised.
+    #
+    # `400000`, `560000`, `640000`, `480000_2` and `480000_3` are deliberately absent and
+    # inherit the nulled default:
+    #   * 560000 and 640000 bracket the ceiling and are DESIGNED to fail - arming a gate on
+    #     a rung whose purpose is to find the knee makes it "all fail loudly", which is not
+    #     what a ceiling hunt wants;
+    #   * 400000 is the low rung, where the numbers should be better than the limits, but a
+    #     limit calibrated at 480k is not a limit at 400k and a passing gate there would
+    #     mean nothing;
+    #   * 480000_2 is B4, the drift control, and it carries the tracing window on node 1 -
+    #     the instrument is expected to cost that node something, which is why nodes 2-4 are
+    #     the control;
+    #   * 480000_3 is B5, which runs with logstor_direct_writes_enabled FALSE and is
+    #     EXPECTED to miss its offered rate (the local B/C pair prices the path at ~27% more
+    #     CPU per operation - plans/run-log.md section 2.C). Gating it would fail the job
+    #     for measuring the thing it was added to measure.
     #
     # A red build is a RESULT here, not a lost run: FailedResultEvent is an
-    # InformationalEvent (sdcm/sct_events/system.py:362), so a drifting R0 colours the job
+    # InformationalEvent (sdcm/sct_events/system.py:362), so a drifting B1 colours the job
     # and the ladder still runs to the end.
     #
     # Plain `480000` carries the same limits so the gate survives a shape with a single
