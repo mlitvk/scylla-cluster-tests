@@ -1,20 +1,26 @@
-# Logstor uniform distribution workload configuration
-# Uses latte_cs_alike.rn with write/read functions.
-# Populate: sequential (i % ROW_COUNT + OFFSET) for full 500M-row coverage.
-# Measured step: random uniform selection (distribution="random" -> hash_range(i, ROW_COUNT))
-# over an unbounded cycle range (no --end-cycle) so the key sequence never repeats within the run.
-# Schema: 10 columns x 200 bytes each (matching kv_uniform.rn reference)
-# Reads use BYPASS CACHE, so a read is served by the storage engine and not the row cache
-# Mixed (write:30,read:70) as a SIX-RUNG RATE LADDER - 400 / 480 / 560 / 640 / 480 / 480k,
-# 12m each - after a 45m write-only conditioning step at 300k that brings the pool to the
-# compaction trigger. Every rung is stationary: the pool is already at the trigger with
-# compaction running when the first one starts, and no rung waits for compactions.
+# Logstor uniform workload - BUILD 10: four workloads on 4 x i8g.4xlarge, max and sustained.
+#
+# The plan is plans/sct-uniform-build10/README.md in the logstor perf repo; section numbers
+# below are that file's. Build 10 is a characterization, not an experiment: the engine,
+# the AMI and the io scheduler flags are build 9's, the hardware moves to i8g.4xlarge, and
+# each of four workloads gets an S rung (a rate meant to pass the latency target) and an X
+# rung (a rate clearly above the predicted ceiling, read for throughput only):
+#   W  write-only
+#   R  read-only, cache miss (BYPASS CACHE, uniform over all 500M rows)
+#   H  read-only, cache hit (a hot set of 8M keys, warmed by its own step)
+#   M  mixed 70/30, BYPASS CACHE - build 9's workload
+# plus D-X: M-X with logstor_direct_writes_enabled FALSE, moved live.
+#
+# Uses latte_cs_alike.rn with write/read functions. Populate: sequential
+# (i % ROW_COUNT + OFFSET) for full 500M-row coverage. Steps: random uniform selection
+# (distribution="random" -> OFFSET + hash_range(i, ROW_COUNT)) over an unbounded cycle
+# range, so the key sequence never repeats within a run. Schema: 10 columns x 200 bytes.
 #
 # TWO LATTE SEMANTICS THAT READ WRONG (method.txt section 4):
 #  --concurrency IS PER THREAD. "Max number of concurrent async requests PER THREAD",
 #    so --threads 64 --concurrency 24 is **1,536 requests in flight per command**, not
-#    24, and two commands run at once. THIS WAS THE BINDING CONSTRAINT IN BUILD 6, and the
-#    reason the read command has its own read_concurrency now. That build sized the cap on
+#    24, and four commands run at once. THIS WAS THE BINDING CONSTRAINT IN BUILD 6, and the
+#    reason the read commands have their own read_concurrency now. That build sized the cap on
 #    an assumed ~2 ms read; the measured read was 10.787 ms, so 3,072 in flight bought only
 #    3,072 / 10.787 ms = 284,800 op/s and the read delivered 284,451 of the 336,000 offered
 #    - Little's Law to within 0.2%.
@@ -22,14 +28,14 @@
 #    not service time: build 6's read cycle p50 was 137 SECONDS against a request latency
 #    of 10.787 ms. Read `Request latency` from the latte summary, never `Cycle latency`,
 #    whenever the offered-rate gate in the runbook's section 7 has failed.
-#    EXPECT THAT ON WHICHEVER RUNGS SATURATE, which is the point of this ladder. And note
+#    EXPECT THAT ON EVERY X RUNG, which saturates by design. And note
 #    the second-order effect: once a rung misses its offered rate, in flight grows to the
 #    cap by definition, so even latte's `Request latency` there carries permit wait. A
 #    saturating rung's LATENCY comes from the server's coordinator_read_latency; only its
 #    THROUGHPUT is readable from latte. Build 7 rung 3 is the worked example - it reported
 #    a cycle p50 of 31.9 SECONDS while the server's coordinator read p99 was 2.46 ms
 #    (sct-uniform-build7-report.md section 2).
-#  --warmup DEFAULTS TO 1 CYCLE, i.e. to nothing. The read command now takes 15s and the
+#  --warmup DEFAULTS TO 1 CYCLE, i.e. to nothing. The read commands take 15s and the
 #    write commands keep 1, and all three of latte's warmup semantics were read out of
 #    latte 0.50.0-scylladb's own src/main.rs before choosing that split:
 #      * THE WARMUP IS EXCLUDED FROM --hdrfile. par_execute gets `&mut None` for the
@@ -47,7 +53,9 @@
 #        correlated-death pattern the slot table exists to prevent, and it would make that
 #        garbage at an uncontrolled rate right before a steady-state measurement. For a
 #        READ command it is inert: a replayed read rewrites nothing, and BYPASS CACHE means
-#        it does not even warm a cache. So the asymmetry is not an oversight.
+#        it does not even warm a cache. (On the H rungs, which read without BYPASS CACHE, it
+#        re-reads a hot set the warmup step already loaded.) So the asymmetry is not an
+#        oversight.
 #    15s IS SIZED ON BUILD 7, AND IT BUYS THE P99. Every read rung in that build opened
 #    with a client-side scheduling backlog: latte delivered 240-260k/s against an offered
 #    336k for five seconds while cycle latency climbed 0.18 -> 1.17 s, then over-fired to
@@ -57,101 +65,90 @@
 #    samples, just over the p99 boundary, which put build 7's full-step p99 read at
 #    402 ms against a steady-state 2.62. Folding rung 1 and rung 2's own histograms from
 #    t=15s gives p99 2.644 and 2.617 and the value is flat out to t=60s, so 15s covers the
-#    worst observed ramp with margin and is what
-#    latency-decorator-error-thresholds-logstor-tablets.yaml now gates on.
-#    Two consequences worth knowing. The conditioning step shares this template, so it too
-#    pays 15s of unthrottled reads against its read_rate of 100 - ~7.5M reads out of a 45m
-#    write-dominated step that is discarded anyway. And the write command, which does not
-#    warm up, has the read's unthrottled warmup inside the first 15s of its own measured
-#    window; that is why its P99 threshold is set loose and flagged for re-tightening.
+#    worst observed ramp with margin.
+#    One consequence worth knowing: every step pays the read commands' 15s of unthrottled
+#    reads, including the write-only ones, where each read half runs flat out at 8 x 64 =
+#    512 in flight before settling to 50/s. That is inside every rung's excluded first
+#    minute (README section 0), and on the discarded conditioning step it does not matter.
 # This test is a part of the benchmark done by Aerospike
 # https://aerospike.com/files/benchmarks/aerospike-vs-scylladb-performance-and-cost-at-multi-terabyte-scale.pdf
 
-# Seven steps: the first conditions the pool and is discarded, and the six that follow are
-# the measurement. The populate writes each of the 500M keys exactly once, so it leaves a
-# pool holding live data and *no garbage at all* - nothing for compaction to reclaim and
-# nothing to reclaim it from. Measuring straight off that pool reports a write
-# amplification of ~1 and a compaction cost of zero, neither of which survives contact
-# with steady state. The conditioning step overwrites - writes only, at 300k - until free
-# segments fall to logstor_compaction_trigger_threshold (~33 minutes at the shipped 0.05),
-# and then keeps going long enough for compaction, write amplification and space
-# amplification to settle.
+# FOUR LATTE COMMANDS, NOT TWO (README section 3.2). The H rungs ask one read stream for up
+# to 2.5M ops/s, and nothing in this series has measured a latte process's ceiling - build 9
+# drove at most 640k from one. So the write and the read are each split into two halves,
+# write_a / write_b / read_a / read_b, all on the one c6i.32xlarge loader. Each half carries
+# HALF THE RUNG'S RATE and its own cycle slot. `rate` in a step is the cluster total and only
+# names the step (and Argus' column); the commands read the per-half write_rate and read_rate
+# and never $throttle.
 #
-# wait_no_compactions: false on the first step is the point of the pair. The default
-# between steps is to wait for compactions to finish and then sleep 180s, which would
-# hand the measured step a pool compaction had just emptied of garbage - the state the
-# conditioning was meant to leave behind. With it off, the measured step starts with the
-# pool at the trigger and compaction already running.
+# n_loaders MUST STAY 1. With four commands, _aggregate_ops_rate returns `total` when
+# num_commands == num_loaders and `total * num_loaders` otherwise - so one loader (x 1) and
+# four loaders (one command each) are right, and two or three multiply the sum. One loader
+# is also one capacity reservation.
 #
-# THE MEASURED STEP IS A RATE LADDER, and build 9 is the run where BOTH ENGINE CHANGES
-# ARE IN FROM THE FIRST BOOT: the reclaim rate controller (engine 662b8906d7) and
-# --io-latency-goal-ms 1.0 (enable_logstor.yaml). Nothing is applied between rungs and no
-# rung needs a restart - which is what build 8 could not have, because its five rungs each
-# reconfigured the network. Two things are applied from outside, both late and both by
-# plans/sct-uniform-build9/rung-driver.sh on the SCT runner, and neither touches a rung
-# whose numbers are quoted from before it:
-#   * a live free-segment setpoint move in B4's last three minutes (threshold 0.05 -> 0.04
-#     -> 0.05), which is the one controller path the single-node validation never
-#     exercised;
-#   * logstor_direct_writes_enabled -> false on all four nodes, in B5's first seconds.
-# Both go through scylla.yaml + SIGHUP, NOT through the REST API: /v2/config/<name> is
-# registered GET-only (api/config.cc, find_config_id), and main.cc:301-314's sighup_handler
-# re-reads the file and broadcasts to all shards. Both options are liveness::LiveUpdate
-# (db/config.cc:986, :990).
+# Every step carries every placeholder, because stress_cmd_m is one template and a command
+# cannot be dropped per step. That is what the 50/s side streams are: the read halves of a
+# write rung and the write halves of a read rung run at 50/s each (100/s per stream), which
+# fills every HDR interval and costs nothing measurable. run_step substitutes `$key`
+# longest key first (performance_regression_gradual_grow_throughput.py:427), and no
+# placeholder here is a `$`-prefix of another: `$read_rate` does not contain `$rate`, and
+# `$read_concurrency` does not contain `$concurrency`. read_bypass and read_cl are QUOTED
+# strings on purpose: run_step renders values with str(), and a YAML boolean would reach
+# latte as `bypass_cache=True`.
 #
-#   rung  rate      read_conc  Argus name   what it asks
-#   B0    400,000      20      400000       the best case. Does the far tail exist at all
-#                                           below build 8's load, and is a sub-ms server
-#                                           p99 reachable anywhere
-#   B1    480,000      24      480000_1     the comparison to build 8. Same rate, config,
-#                                           conditioning and gate. THE ANCHOR, and the one
-#                                           rung the thresholds file gates
-#   B2    560,000      28      560000       just under the ~571k that build 7's 84% reactor
-#                                           utilisation at 480k extrapolates to
-#   B3    640,000      32      640000       clearly past it. B2/B3 bracket the knee
-#   B4    480,000      24      480000_2     B1 repeated. Proves no drift across the hour,
-#                                           and carries the full-tracing window on node 1
-#   B5    480,000      24      480000_3     B1 again with logstor_direct_writes_enabled
-#                                           FALSE, applied live. What the direct write path
-#                                           is worth at cluster scale
+# THE LADDER, in the order it runs (README section 3.1). Each rung 8m, read from t = 60 s:
 #
-# Ascending order with the repeat at B4 is deliberate: the pool ages monotonically through
-# the run, so B1 and B4 straddle every other rung and bound the drift they could hide. B5
-# is last because it is the only rung that changes the engine's configuration, and putting
-# it anywhere else would leak that change into a rung after it.
+#   k  rung  rate        writes / reads      read_cl  rows   bypass  Argus step
+#   0  cond    600,000   600k / 100          ONE      500M   true    600000      30m, discarded
+#   1  W-S     800,000   800k / 100          ONE      500M   true    800000
+#   2  R-S     920,000   100 / 920k          ONE      500M   true    920000
+#   3  R-X   1,500,000   100 / 1.5M          ONE      500M   true    1500000
+#   4  warm    300,000   100 / 300k          ALL        8M   false   300000      not quoted
+#   5  H-S   1,600,000   100 / 1.6M          ONE        8M   false   1600000
+#   6  H-X   2,500,000   100 / 2.5M          ONE        8M   false   2500000
+#   7  M-S     850,000   255k / 595k         ONE      500M   true    850000
+#   8  M-X   1,400,000   420k / 980k         ONE      500M   true    1400000_1
+#   9  D-X   1,400,000   420k / 980k         ONE      500M   true    1400000_2   direct writes OFF, live
+#  10  W-X   1,450,000   1.45M / 100         ONE      500M   true    1450000     direct writes back ON, live
 #
-# B5 IS EXPECTED TO MISS ITS OFFERED RATE, and that is not a failure of the run. The local
-# B/C measurement on aws2 (plans/run-log.md section 2.C, two shards at 1/8 of the same
-# i4g NVMe, reached by the same live switch) priced the path directly: throughput
-# 72,213 -> 68,043 replica ops/s (-5.8%) at the ceiling, wa 1.40 -> 2.42 (+73%) there and
-# 1.33 -> 3.08 (2.3x) at sustainable rates, separator share 4.2% -> 41.8%, and ~27% MORE
-# CPU PER OPERATION at a matched rate. Build 7 delivered 480k at ~84% reactor utilisation,
-# so +27% per operation does not fit inside the node: expect a delivered rate somewhere
-# around 400-460k and read latency dominated by queueing. Consequently:
-#   * B5's THROUGHPUT is the number to read, from latte's delivered rate, and its LATENCY
-#     from the server's coordinator_read_latency - not from latte's Cycle latency, which
-#     becomes scheduling lag the moment the offered rate is missed (see above), and not
-#     from its Request latency either, which carries permit wait once in flight pins at
-#     the cap.
-#   * read_concurrency stays 24, the same cap as B1 and B4. The comparison is one setting
-#     moved; a cap that moved with it would make it two.
-#   * segment_pool_normal_segments_wait is the counter to watch. It went 2,609 -> 6,672 in
-#     the local B/C pair, so write stalls are expected here and are a MEASUREMENT, not the
-#     revert signal that the same counter is on the direct-ON rungs.
-#   * 12 minutes at 144k writes/s is 1.04e8 writes against 500M rows, so only ~19% of live
-#     records get rewritten by the separator path. B5 therefore prices the direct path's
-#     FOREGROUND cost and its immediate effect on reads; it does NOT measure a
-#     steady-state compaction over a separator-written population, which would need a
-#     turnover of 2-3 row counts (plans/run-log.md section 2.C used 6.97).
+# WHY THIS ORDER. First, what can end the run: latte 0.50.0 stops its run on the first
+# cycle whose query fails eleven times (--retry-number 10; exec/workload.rs:516-518 and
+# run_stream's terminate_after_error(); only Overloaded is exempt), exits non-zero, and
+# sdcm/stress/latte_thread.py:355-364 makes that a CRITICAL event that stops the test. For
+# a logstor write that means the low-on-segments timeout, i.e. compaction falling behind -
+# so the saturating write rungs, M-X, D-X and W-X, go after everything they could take with
+# them, the M-X/D-X comparison before W-X. Then the pool and the cache: W-S follows the
+# conditioning step's load shape straight on; reads make no garbage, so the pool sits at
+# the trigger through R and H; BYPASS reads never touch the cache, so R does not disturb
+# what the warmup then builds; and nothing after H-X needs the hot set. D-X sits next to
+# M-X because build 9's same-rung repeat differed 4x on its worst node an hour apart.
 #
-# READ CONCURRENCY SCALES WITH THE RATE, at read_concurrency = rate / 20000 - build 7's
-# rule, and the right one for a rate ladder where a flat cap would bind at a different
-# latency on every rung. --concurrency is PER THREAD and there are 64 threads, so 20 / 24 /
-# 28 / 32 is 1,280 / 1,536 / 1,792 / 2,048 requests in flight. Each is ~5x the in-flight
-# need that rung's own arithmetic gives at build 7's measured ~2.6 ms read, so the loader
-# never reports its own cap as the cluster's latency below ~4.5 ms - and B1, B4 and B5 are
-# build 7 rung 2 exactly at read_concurrency 24, which is what makes them comparable to it
-# and to build 8's R0.
+# RATES ARE UNIQUE BY DESIGN. A step is named for its rate and only a REPEATED rate gets
+# `_1` / `_2` (_step_names), so two workloads at one rate would be told apart by order
+# alone. M-X and D-X share 1.4M deliberately - one setting moved - which is also why W-X
+# is 1.45M. `300000` is the warmup, and it collides with a calibrated cassandra-stress
+# entry in the ent-tablets thresholds file; latency-decorator-error-thresholds-logstor-
+# tablets.yaml nulls it. ADDING OR REORDERING A RUNG CHANGES STEP NAMES: check them against
+# SCT's own code, never by eye.
+#
+# THE CACHE-HIT RUNGS (README section 3.7). The logstor value cache is read-through: a read
+# without bypass_cache populates it and a write evicts the key it overwrites. The hot set is
+# keys 0..8M (`read_rows` 8000000, offset 0 - keys the populate wrote; the key is
+# blob(idx, 48), a function of the index alone). The warmup step reads it at CL=ALL for 8
+# minutes - 144M reads, ~18 per key - so both replicas load whether or not a digest read
+# populates: if it does, e^-18 stays cold; if it does not, each replica still sees ~9 and
+# e^-9 = 0.012% stays cold. It has to work first time: H-S starts as soon as the warmup
+# ends, and a second warmup by hand would land inside it. The write halves' 50/s evict
+# ~770 hot keys over a whole H rung (8M / 500M of 48,000 writes).
+#
+# IN-FLIGHT CAPS (README section 3.4). threads 64 everywhere, so step names stay rate-only
+# (get_sequential_throttle_steps switches to `<rate>_<threads>_threads` when thread counts
+# differ). Each cap is per command = 64 x concurrency, sized at ~5 ms of that half's rate -
+# build 7's rate/20000 rule restated for split commands - so the loader never reports its
+# own cap as latency below ~5 ms mean. Writes keep 48 (3,072 in flight per half) except
+# W-X (64) and both mixed X rungs (96), where write latency is expected to grow. M-X and
+# D-X carry IDENTICAL caps, raised to 96 on both, so D-X's write latency cannot bind at 420k
+# and turn a one-setting comparison into two.
 #
 # THE CYCLE SLOT TABLE. latte derives a key from the cycle id - random distribution is
 # OFFSET + hash_range(i, ROW_COUNT), a pure function of i - and the column values are
@@ -159,131 +156,124 @@
 # same keys in the same order with the same bytes. The second then kills the first's
 # records front to back: whole segments die together instead of decaying uniformly,
 # compaction faces a bimodal population and **write amplification comes out
-# flatteringly low** - the one number this test exists to measure. method.txt section 5
-# is the rule; these are its slots for this test.
+# flatteringly low**. method.txt section 5 is the rule. Step k, by row above:
 #
-#   300000          write              1     read   5_000_000_000
-#   400000    B0    write 10_000_000_000     read  15_000_000_000
-#   480000_1  B1    write 20_000_000_000     read  25_000_000_000
-#   560000    B2    write 30_000_000_000     read  35_000_000_000
-#   640000    B3    write 40_000_000_000     read  45_000_000_000
-#   480000_2  B4    write 50_000_000_000     read  55_000_000_000
-#   480000_3  B5    write 60_000_000_000     read  65_000_000_000
+#   write_a = k*20e9 + 1     write_b = k*20e9 + 5e9
+#   read_a  = k*20e9 + 10e9  read_b  = k*20e9 + 15e9
 #
-# Twelve slots for the measured steps, not two, and that is not optional: a slot may be
-# reused from RUN to run - logstor_format_on_startup: true reformats the pool and the
-# populate rewrites every key - but never within one pool's lifetime, which is exactly
-# what rungs sharing a slot would do. THE THREE 480k RUNGS MAKE THIS STRICTER, NOT LOOSER:
-# identical rates on a shared slot would replay an identical key stream, so B4 and B5 would
-# each kill their predecessor's records front to back and would measure a bimodal segment
-# population instead of steady state. It is also what makes B4 usable as a drift control
-# and B5 as a write-path comparison - replaying B1's own keys would measure the replay.
+# The largest consumption by one half is H-X's read, 1,250,000 x 480 s = 6.0e8, then
+# conditioning's write, 300,000 x 1,800 s = 5.4e8 - both far inside the 5e9 spacing. The
+# 15s read warmups replay their own run's first cycles (above), so they consume nothing
+# extra. The read halves follow the scheme too, although a read rewrites nothing, so the
+# table stays mechanical. A slot may be reused from RUN to run - logstor_format_on_startup:
+# true reformats the pool and the populate rewrites every key - but never within one pool's
+# lifetime. Recheck whenever a rate or a duration changes: cycles consumed is rate x
+# seconds. The populate needs no slot: it runs the sequential distribution.
 #
-# Spacing is 5e9, not method.txt's 1e9: that figure is sized for its 5-minute runs
-# (~120M cycles). The largest rung here, B3 at 640k, consumes 448,000 x 720 = 3.23e8 on the
-# read and 192,000 x 720 = 1.38e8 on the write, so margins are >= 4.68e9. Recheck the table
-# whenever a rate or a duration changes: cycles consumed is rate x seconds. The populate
-# needs no slot of its own - it runs the sequential distribution (i % ROW_COUNT), a
-# different mapping, so it replays nothing these steps do and nothing they do replays it.
+# CONDITIONING IS WRITE-ONLY, AT 600k FOR 30 MINUTES, because only writes make garbage. At
+# 600k client writes/s a node lays down ~660 MB/s of fresh log, so the ~643 GB of garbage
+# the 0.05 trigger needs arrives at ~16 minutes, leaving ~14 for compaction, wa and sa to
+# settle. Its last ~14 minutes are a free third write-only data point.
 #
-# A REPEATED RUN TAKES A NEW SLOT. If you re-run a step against a pool an earlier run
-# already wrote, shift its slot; re-using it is exactly the replay this table prevents.
-# CONDITIONING IS WRITE-DOMINATED, because only writes make garbage. Reads cost
-# device budget and move the trigger no closer, so the old 30/70 conditioning step
-# needed ~68 minutes to reach 5% free and never got there inside 30. At 300k client
-# writes/s a node lays down ~330 MB/s of fresh log, so the ~643 GB of garbage the
-# trigger needs arrives at **~33 minutes**, and a 45m step leaves ~12 minutes for
-# compaction, wa and sa to settle before anything is measured. This mirrors
-# method.txt's own CONDITION step, which is --read-ratio 0.
+# wait_no_compactions: false on EVERY step. Between rungs it is what keeps the pool at the
+# trigger: the default drains compactions and then sleeps to 180s, handing the next rung a
+# pool emptied of the garbage the conditioning step created. With it off, a rung follows
+# the one before after only the decorator's own post-step work, ~2.5 minutes.
 #
-# read_rate is 100 rather than 0: stress_cmd_m is one template shared by every step, so
-# the read command cannot be dropped for the conditioning one without an sdcm change, and
-# latte's runtime behaviour for `--rate 0` is unverified - if it meant "unthrottled"
-# rather than "no cycles" the conditioning step would saturate on reads. 100 cycles/s is
-# ~270,000 reads over 45 minutes against ~810M writes: nothing, and unambiguous.
-#
-# 100 and not 1, which is what build 6 ran. At 1/s most HDR intervals contain no read
-# sample at all, so LatteHDRExporter.split_line (sdcm/loader.py:312) gets an empty
-# histogram, logs "Got empty HDR histogram summary", and returns [] - and
-# get_metric_value (sdcm/loader.py:101) then logs one "list index out of range" warning
-# per percentile. Six lines per interval, ~9,700 over the step, about half of build 6's
-# console. Harmless - it only starves the live Grafana read-latency panel, since Argus
-# reads the .hdr files over the whole step via make_hdrhistogram_summary
-# (sdcm/tester.py:5004), a different path - and this step is discarded anyway. But the
-# noise buries the lines that do matter. 100/s fills every interval, still costs
-# essentially no device budget, and moves the compaction trigger no closer.
-#
-# wait_no_compactions: false on EVERY step, including the last. Between rungs it is what
-# keeps the pool at the trigger: the default drains compactions and then sleeps to 180s
-# (performance_regression_gradual_grow_throughput.py:615), handing the next rung a pool
-# emptied of the garbage the conditioning step spent 45 minutes creating. On the final
-# rung it only skips a trailing wait, and whether compaction goes idle once the load
-# stops - the runbook's section 7 check - is visible in Grafana without it. It also has a
-# second job in this build: it is what makes the rung boundaries EXACTLY 720 s apart, which
-# is what rung-driver.sh's clock and the two live transitions are timed against.
-#
-# The write command keeps concurrency: 48 at every rung. Writes held 143,998 of 144,000 at
-# ~2 per thread in build 7 and are not a factor: even the 640k rung needs 192,000 x ~1.0 ms
-# = ~192 in flight, ~3 per thread, and a per-thread cap of 48 against 3,000 writes/s/thread
-# does not bind until 16 ms. Only the read cap is sized per rung, so the write side stays
-# one fewer variable.
+# The two live switches - D-X off at +5 s, W-X back on at +5 s - are applied from outside
+# by the plan's rung-driver.sh through scylla.yaml + SIGHUP, NOT through the REST API:
+# /v2/config/<name> is registered GET-only (api/config.cc, find_config_id).
+
 perf_gradual_throttle_steps:
   mixed:
-    - {threads: 64, concurrency: 48, read_concurrency: 24,
-       rate: '300000', write_rate: '300000', read_rate: '100',
-       write_start_cycle: 1, read_start_cycle: 5000000000,
-       duration: '45m', wait_no_compactions: false}
-    # B0, Argus 400000 - the best case, and the only rung where a sub-ms server-side p99
-    # is a live possibility: the load is 17% below B1's and reactor headroom rises from
-    # ~16% to ~30%, which shrinks the CPU term rather than the io one.
-    - {threads: 64, concurrency: 48, read_concurrency: 20,
-       rate: '400000', write_rate: '120000', read_rate: '280000',
-       write_start_cycle: 10000000000, read_start_cycle: 15000000000,
-       duration: '12m', wait_no_compactions: false}
-    # B1, Argus 480000_1 - THE ANCHOR. Build 7 rung 2 and build 8 R0's rate, mix and
-    # read_concurrency exactly, so the far tail and the per-node spread are read against
-    # build 8's own R0 numbers. The only rung the thresholds file gates.
-    - {threads: 64, concurrency: 48, read_concurrency: 24,
-       rate: '480000', write_rate: '144000', read_rate: '336000',
-       write_start_cycle: 20000000000, read_start_cycle: 25000000000,
-       duration: '12m', wait_no_compactions: false}
-    # B2, Argus 560000 - just under the extrapolated ~571k ceiling. Deliberately ungated.
-    - {threads: 64, concurrency: 48, read_concurrency: 28,
-       rate: '560000', write_rate: '168000', read_rate: '392000',
-       write_start_cycle: 30000000000, read_start_cycle: 35000000000,
-       duration: '12m', wait_no_compactions: false}
-    # B3, Argus 640000 - clearly past it, and the rung plans/io-sched-sim.py explicitly
-    # does NOT cover: it models the device as a fixed latency plus a transfer term with
-    # ample parallelism, so it cannot price a device driven far past depth ~26. A B3 miss
-    # does not falsify the simulation. Deliberately ungated.
-    - {threads: 64, concurrency: 48, read_concurrency: 32,
-       rate: '640000', write_rate: '192000', read_rate: '448000',
-       write_start_cycle: 40000000000, read_start_cycle: 45000000000,
-       duration: '12m', wait_no_compactions: false}
-    # B4, Argus 480000_2 - B1 repeated, the ladder's drift control. It carries the full
-    # tracing window on node 1 (trace_probability 0.0001 for two minutes, from minute 2)
-    # and the live setpoint move in its last three minutes, exactly as build 8's R4
-    # carried the off-CPU capture and for the same reason: B1 stays a pristine 480k anchor
-    # and the B1<->B4 comparison ON NODES 2-4 prices whatever the instrument costs node 1.
-    - {threads: 64, concurrency: 48, read_concurrency: 24,
-       rate: '480000', write_rate: '144000', read_rate: '336000',
-       write_start_cycle: 50000000000, read_start_cycle: 55000000000,
-       duration: '12m', wait_no_compactions: false}
-    # B5, Argus 480000_3 - B1 again with logstor_direct_writes_enabled FALSE, moved live on
-    # all four nodes in the rung's first seconds. No restart and no re-populate: the option
-    # is liveness::LiveUpdate (db/config.cc:990) and the pool is unchanged, so what varies
-    # against B1 and B4 is one setting. logstor_direct_write_memory_in_mb stays 64 - the
-    # switch script edits ONE key in scylla.yaml and diffs the file to prove it, because a
-    # budget that fell back to the shipped 2 MB would make this two settings moved and the
-    # local bench measured that partial state as WORSE for write p99 than either end.
-    # See the header for why a rate deficit here is the expected result and not a failure.
-    - {threads: 64, concurrency: 48, read_concurrency: 24,
-       rate: '480000', write_rate: '144000', read_rate: '336000',
-       write_start_cycle: 60000000000, read_start_cycle: 65000000000,
-       duration: '12m', wait_no_compactions: false}
+    # cond, Argus 600000 - write-only conditioning to the trigger, DISCARDED.
+    - {threads: 64, rate: '600000',
+       write_rate: 300000, concurrency: 48, read_rate: 50, read_concurrency: 8,
+       read_cl: 'ONE', read_rows: 500000000, read_bypass: 'true',
+       write_a_start: 1, write_b_start: 5000000000,
+       read_a_start: 10000000000, read_b_start: 15000000000,
+       duration: '30m', wait_no_compactions: false}
+    # W-S, Argus 800000 - write-only, sustained. 800k and not 900k: 900k would put ~7.9 Gbps
+    # into each node, 84% of i8g.4xlarge's 9.375 Gbps baseline (README section 1.1).
+    - {threads: 64, rate: '800000',
+       write_rate: 400000, concurrency: 48, read_rate: 50, read_concurrency: 8,
+       read_cl: 'ONE', read_rows: 500000000, read_bypass: 'true',
+       write_a_start: 20000000001, write_b_start: 25000000000,
+       read_a_start: 30000000000, read_b_start: 35000000000,
+       duration: '8m', wait_no_compactions: false}
+    # R-S, Argus 920000 - read-only, cache miss, sustained. No writes, so no compaction.
+    - {threads: 64, rate: '920000',
+       write_rate: 50, concurrency: 48, read_rate: 460000, read_concurrency: 36,
+       read_cl: 'ONE', read_rows: 500000000, read_bypass: 'true',
+       write_a_start: 40000000001, write_b_start: 45000000000,
+       read_a_start: 50000000000, read_b_start: 55000000000,
+       duration: '8m', wait_no_compactions: false}
+    # R-X, Argus 1500000 - read-only, cache miss, max. The io-token model binds near ~1.24M.
+    - {threads: 64, rate: '1500000',
+       write_rate: 50, concurrency: 48, read_rate: 750000, read_concurrency: 60,
+       read_cl: 'ONE', read_rows: 500000000, read_bypass: 'true',
+       write_a_start: 60000000001, write_b_start: 65000000000,
+       read_a_start: 70000000000, read_b_start: 75000000000,
+       duration: '8m', wait_no_compactions: false}
+    # warm, Argus 300000 - the hot-set warmup, CL=ALL over keys 0..8M, NOT QUOTED. read_bypass
+    # false so it populates; 8 minutes so it works whether or not a digest read populates.
+    - {threads: 64, rate: '300000',
+       write_rate: 50, concurrency: 48, read_rate: 150000, read_concurrency: 32,
+       read_cl: 'ALL', read_rows: 8000000, read_bypass: 'false',
+       write_a_start: 80000000001, write_b_start: 85000000000,
+       read_a_start: 90000000000, read_b_start: 95000000000,
+       duration: '8m', wait_no_compactions: false}
+    # H-S, Argus 1600000 - read-only, cache hit, sustained.
+    - {threads: 64, rate: '1600000',
+       write_rate: 50, concurrency: 48, read_rate: 800000, read_concurrency: 64,
+       read_cl: 'ONE', read_rows: 8000000, read_bypass: 'false',
+       write_a_start: 100000000001, write_b_start: 105000000000,
+       read_a_start: 110000000000, read_b_start: 115000000000,
+       duration: '8m', wait_no_compactions: false}
+    # H-X, Argus 2500000 - read-only, cache hit, max. 2.5M and not more: the NIC baseline and
+    # cpu0 both cap the cluster near 2.1M (README section 3.2).
+    - {threads: 64, rate: '2500000',
+       write_rate: 50, concurrency: 48, read_rate: 1250000, read_concurrency: 100,
+       read_cl: 'ONE', read_rows: 8000000, read_bypass: 'false',
+       write_a_start: 120000000001, write_b_start: 125000000000,
+       read_a_start: 130000000000, read_b_start: 135000000000,
+       duration: '8m', wait_no_compactions: false}
+    # M-S, Argus 850000 - mixed 70/30, sustained.
+    - {threads: 64, rate: '850000',
+       write_rate: 127500, concurrency: 48, read_rate: 297500, read_concurrency: 24,
+       read_cl: 'ONE', read_rows: 500000000, read_bypass: 'true',
+       write_a_start: 140000000001, write_b_start: 145000000000,
+       read_a_start: 150000000000, read_b_start: 155000000000,
+       duration: '8m', wait_no_compactions: false}
+    # M-X, Argus 1400000_1 - mixed 70/30, direct writes ON, max. Write cap 96 - see D-X.
+    - {threads: 64, rate: '1400000',
+       write_rate: 210000, concurrency: 96, read_rate: 490000, read_concurrency: 40,
+       read_cl: 'ONE', read_rows: 500000000, read_bypass: 'true',
+       write_a_start: 160000000001, write_b_start: 165000000000,
+       read_a_start: 170000000000, read_b_start: 175000000000,
+       duration: '8m', wait_no_compactions: false}
+    # D-X, Argus 1400000_2 - M-X with logstor_direct_writes_enabled FALSE, moved live on all
+    # four nodes in the rung's first seconds (liveness::LiveUpdate). Caps IDENTICAL to M-X.
+    - {threads: 64, rate: '1400000',
+       write_rate: 210000, concurrency: 96, read_rate: 490000, read_concurrency: 40,
+       read_cl: 'ONE', read_rows: 500000000, read_bypass: 'true',
+       write_a_start: 180000000001, write_b_start: 185000000000,
+       read_a_start: 190000000000, read_b_start: 195000000000,
+       duration: '8m', wait_no_compactions: false}
+    # W-X, Argus 1450000 - write-only, max, with direct writes switched back ON live in the
+    # rung's first seconds. Last, because a saturating write rung is the likeliest to end
+    # the test (header).
+    - {threads: 64, rate: '1450000',
+       write_rate: 725000, concurrency: 64, read_rate: 50, read_concurrency: 8,
+       read_cl: 'ONE', read_rows: 500000000, read_bypass: 'true',
+       write_a_start: 200000000001, write_b_start: 205000000000,
+       read_a_start: 210000000000, read_b_start: 215000000000,
+       duration: '8m', wait_no_compactions: false}
 perf_gradual_step_duration: {"mixed": '60m'}
 
-# No cache warmup for uniform workload (data is uniformly distributed, no hot set)
+# No SCT cache warmup: the hot set for the H rungs is warmed by its own step (`300000`), at
+# CL=ALL, where it can be timed and measured. [] is not null - warmup_cache([]) runs as a
+# no-op and the test then sleeps 240 s (runbook trap 6).
 stress_cmd_cache_warmup: []
 
 prepare_stress_cmd: >-
@@ -292,50 +282,65 @@ prepare_stress_cmd: >-
   data_dir/latte/latte_cs_alike.rn
 
 # Populate 500M rows with uniform distribution
-# 400k, not 250k: the populate is pure writes with compaction idle throughout (the pool
-# only fills to ~56% free, nowhere near the 5% trigger), so it is the lightest phase of
-# the run and there is no reason to throttle it to below the conditioning step's rate.
-# 400k client writes/s is 200k replica writes/s per node, ~440 MB/s of fresh log and
-# ~13.3k per shard against the ~37,700 per-hyperthread CPU ceiling - so ~21 minutes
-# instead of ~33. Build 5 delivered 250k in exactly the 33.3 min the arithmetic
-# predicts, so 250k was a floor and not a ceiling.
+# 600k, not 400k: the populate is pure writes with compaction idle throughout (the pool
+# only fills to ~56% free, nowhere near the 5% trigger), and build 9's populate drained its
+# backlog at ~820k/s on Graviton2 once the slow-query log was off. 600k is well inside one
+# latte process and one i8g cluster: 500M rows in ~14 minutes. It carries ~5.3 Gbps into
+# each node, 56% of the NIC baseline.
 #
-# threads/concurrency rise with it, and must: --concurrency is PER THREAD, so 32 x 32
-# caps in flight at 1,024, which covers 400k only if writes land inside 2.56 ms. At
-# CL=ALL they will not. 64 x 48 = 3,072 covers up to ~7.7 ms, and the rate cap still
-# governs the offered load.
+# It is also the loader calibration (README section 3.2): one latte process, 64 threads,
+# 600k/s on the c6i.32xlarge. Its CPU per delivered op is the only latte cost figure the
+# run has before H-X asks the box for ~2.1-2.5M.
 #
-# TWO FAILURE MODES, AND ONLY ONE IS SAFE. If the cluster cannot absorb 400k, latte
+# threads/concurrency: --concurrency is PER THREAD, so 64 x 48 = 3,072 in flight covers
+# 600k up to ~5 ms per write at CL=ALL, and the rate cap still governs the offered load.
+#
+# TWO FAILURE MODES, AND ONLY ONE IS SAFE. If the cluster cannot absorb the rate, latte
 # reports a rate deficit and the populate simply takes longer - visible and harmless.
 # If instead writes start erroring at CL=ALL, the affected rows are never written and
 # the data set is quietly smaller than 500M, which moves live data off ~556 GB and
 # invalidates every utilization and time-to-trigger figure downstream. So after the
 # populate, check the latte summary for errors and confirm pool utilization is ~44%
-# before trusting the run. Drop back toward 250k if either looks wrong.
+# before trusting the run.
 prepare_write_cmd:
   - >-
     latte run --function write --consistency ALL --duration 500000000
-    --threads 64 --concurrency 48 --rate 400000
+    --threads 64 --concurrency 48 --rate 600000
     --start-cycle 1 --end-cycle 500000000
     -P row_count=500000000 -P offset=0
     -P column_count=10 -P column_size=200 -P key_size=48
     data_dir/latte/latte_cs_alike.rn
 
-# Mixed workload: uniform write:30,read:70 for $duration, split to use different consistency levels
+# Four commands: two halves each of the write and the read (README section 3.3). The
+# halves of a pair are identical except for their start cycle.
 stress_cmd_m:
   - >-
     latte run --function write --consistency QUORUM --duration $duration
     --threads $threads --concurrency $concurrency --rate $write_rate
-    --start-cycle $write_start_cycle --warmup 1
+    --start-cycle $write_a_start --warmup 1
     -P row_count=500000000 -P offset=0 -P distribution=\"random\"
     -P column_count=10 -P column_size=200 -P key_size=48
     data_dir/latte/latte_cs_alike.rn
   - >-
-    latte run --function read --consistency ONE --duration $duration
-    --threads $threads --concurrency $read_concurrency --rate $read_rate
-    --start-cycle $read_start_cycle --warmup 15s
+    latte run --function write --consistency QUORUM --duration $duration
+    --threads $threads --concurrency $concurrency --rate $write_rate
+    --start-cycle $write_b_start --warmup 1
     -P row_count=500000000 -P offset=0 -P distribution=\"random\"
-    -P column_count=10 -P column_size=200 -P key_size=48 -P bypass_cache=true
+    -P column_count=10 -P column_size=200 -P key_size=48
+    data_dir/latte/latte_cs_alike.rn
+  - >-
+    latte run --function read --consistency $read_cl --duration $duration
+    --threads $threads --concurrency $read_concurrency --rate $read_rate
+    --start-cycle $read_a_start --warmup 15s
+    -P row_count=$read_rows -P offset=0 -P distribution=\"random\"
+    -P column_count=10 -P column_size=200 -P key_size=48 -P bypass_cache=$read_bypass
+    data_dir/latte/latte_cs_alike.rn
+  - >-
+    latte run --function read --consistency $read_cl --duration $duration
+    --threads $threads --concurrency $read_concurrency --rate $read_rate
+    --start-cycle $read_b_start --warmup 15s
+    -P row_count=$read_rows -P offset=0 -P distribution=\"random\"
+    -P column_count=10 -P column_size=200 -P key_size=48 -P bypass_cache=$read_bypass
     data_dir/latte/latte_cs_alike.rn
 
 latte_schema_parameters:

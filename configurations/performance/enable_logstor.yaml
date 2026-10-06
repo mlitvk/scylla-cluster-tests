@@ -26,11 +26,10 @@ append_scylla_yaml:
   # x 15 shards = 1.26 TB per node against ~556 GB of live data (44% utilization), so
   # ~51 points of the pool - ~643 GB per node - must fill with garbage before the
   # trigger fires. Only writes make garbage, which is why that step is write-only: at
-  # 300k client writes/s x RF 2 over 4 nodes a node lays down ~330 MB/s of fresh log
-  # and the trigger arrives at **~33 minutes**, leaving ~12 of the step's 45 for
-  # compaction, wa and sa to settle. The 480000 step that follows therefore starts
-  # with the pool at the trigger and compaction already running, and is stationary
-  # over its whole 30 minutes - its Argus aggregates are quotable as they stand.
+  # build 10's 600k client writes/s x RF 2 over 4 nodes a node lays down ~660 MB/s of
+  # fresh log and the trigger arrives at **~16 minutes**, leaving ~14 of the step's 30
+  # for compaction, wa and sa to settle. Every rung after it therefore starts with the
+  # pool at the trigger. (Builds 6-9: 300k, ~33 minutes, of a 45-minute step.)
   #
   # The earlier shape conditioned at the measured 30/70 mix for 30 minutes, which
   # reaches only ~288 GB and pushed the crossover ~37 minutes into the measured step;
@@ -77,21 +76,29 @@ append_scylla_yaml:
 # what changes is the granularity of reservation. That is why it is nearly free.
 #
 # A LOST FLAG IS INVISIBLE IN EVERY METRIC - the cluster simply behaves like build 8
-# with a new engine - so plans/sct-uniform-build9/preflight.sh greps both out of
-# `pgrep -a scylla` on all four nodes before the first measured rung, and the run stops
-# if either is missing.
+# with a new engine - so the plan's preflight.sh greps both out of `pgrep -a scylla` on
+# all four nodes early in the populate, and the run stops if either is missing.
 append_scylla_args: '++ --task-quota-ms 0.2 --io-latency-goal-ms 1.0'
 
 n_db_nodes: 4
 n_loaders: 1
-# Nodes used to replicate the Aerospike test to be able to compare the results.
-# i4g.4xlarge is Graviton, so the db nodes need an aarch64 build. Two routes derive
+# Build 10 moves the db nodes from i4g.4xlarge (builds 6-9) to i8g.4xlarge: same 16 vCPU,
+# 128 GiB and 3,750 GB NVMe, so the same 15 shards and the same 80 GB-per-shard pool, but
+# Graviton4 and an io_properties table with ~2.1x the read iops and ~3.3x the write
+# bandwidth. The AMI's aws_io_params.yaml carries i8g.4xlarge, so no iotune runs at boot.
+# The NIC did NOT grow: 9.375 Gbps baseline / 25 burst, as on i4g (plans/sct-uniform-
+# build10/README.md section 1.1).
+# i8g.4xlarge is Graviton, so the db nodes need an aarch64 build. Two routes derive
 # that from instance_type_db: the unified_package / relocatable: path in sct_config,
 # and byoScylladb.groovy, which asks 'hydra get-db-arch' and installs the ARM image
-# it built. A plain scylla_version or scylla_ami_id derives nothing and will hand
-# these nodes an x86_64 build.
-instance_type_db: 'i4g.4xlarge'
-instance_type_loader: 'c6i.16xlarge'
+# it built. A plain scylla_version derives nothing and will hand these nodes an x86_64
+# build; scylla_ami_id must name the arm64 image (the runbook's section 2.1 route).
+instance_type_db: 'i8g.4xlarge'
+# One c6i.32xlarge for all four latte commands (README section 3.2): 128 Ice Lake vCPU,
+# the same microarchitecture as build 9's c6i.16xlarge, so its measured 30-37 vCPU-us per
+# op carries over, and 50 Gbps, which H-X's ~2.1M plateau fills to ~75%. The c6in.32xlarge
+# would add 150 Gbps nothing uses, at $7.26/h against $5.44/h.
+instance_type_loader: 'c6i.32xlarge'
 
 simulated_racks: 2
 rack_aware_loader: true
